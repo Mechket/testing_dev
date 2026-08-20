@@ -754,3 +754,6 @@ dkuspark.write_with_schema(non_benef_cohortes_output, non_benef_table)
 # Table principale des bénéficiaires
 table_principale_output = dataiku.Dataset("table_principale")
 dkuspark.write_with_schema(table_principale_output, table_principale)
+
+
+At line 444: <class 'pyspark.sql.utils.AnalysisException'>: Resolved attribute(s) id_prs#92 missing from Budget#11,lb_situation_familiale_M#3052,Diagnostic_bilan_social#12,nbr_mois_depuis_pre_ach_M#2938,Rapport_PERP#32,id_prs#20181,Diagnostic_retraite#19,lb_dex_M#3090,Unite_organisationnelle_code#1,id_prs_edixit#2560,Investissements_immobiliers#23,Nom_du_conseiller#4,Synthese#28,Rapport_audit_investisseur#33,Rapport_Madelin#30,top_pre_cib_M1#3645,lb_genre_M1#3531,Rapport_audit_transmission#36,Portefeuille_code#3,cd_ptf_M1#3626,nbr_mois_depuis_pre_ach_M1#3436,Rapport_protection_du_foyer#41,Rapport_DER#29,lb_csp_agg_M#2976,lb_genre_M
