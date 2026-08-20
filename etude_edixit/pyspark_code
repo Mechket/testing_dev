@@ -1,0 +1,756 @@
+# -*- coding: utf-8 -*-
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark import SparkContext
+from pyspark.sql import SQLContext
+from pyspark.sql import functions as F
+from pyspark.sql import SparkSession, HiveContext
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+
+# Configuration Spark
+sparkSession = (SparkSession
+    .builder
+    .config('spark.driver.memory', '40g')
+    .config('spark.executor.memory', '16g')
+    .config('spark.executor.instances', 10)
+    .config('spark.sql.autoBroadcastJoinThreshold', -1)
+    .config('spark.sql.parquet.writeLegacyFormat', True)
+    .enableHiveSupport()
+    .getOrCreate())
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# Variables
+DATE_deb_perim = 202404
+DATE_fin_perim = 202606
+
+socio_metrics = [       
+    "age_pph", "fcm_median", "nbr_mois_depuis_pre_ach",
+    "lb_type_marche", "lb_csp_agg", "lb_anciennete_tr", "lb_fcm_median_tr", "lb_genre", "lb_situation_familiale", "lb_cap_jur", "lb_dex", "lb_dr", "cd_ptf", "top_pre_cib", "pinv"
+]
+
+seg_metrics = [
+    "cd_seg_com_marche_aff", "cd_seg_com_marche_aff_av_fra", "cd_seg_com_marche_stb", "cd_seg_com_marche_stb_av_fra", "cd_seg_com_top_frag", "cd_seg_com_engag_aff", "cd_seg_com_top_nouveau", "cd_filiere_bpe", "cd_seg_com_top_mab", "cd_seg_com_top_mab_comp","cd_cluster_mkt"
+]
+
+equip_metrics = ["top_det_gam_ass_vie", "top_det_gam_credit_perso", "top_det_gam_epa_log", "top_det_gam_epa_ord", "top_det_gam_iard", "top_det_gam_credit_immo", "top_det_gam_prev", "top_det_gam_sante", "top_det_gam_val_mob", "top_det_gam_aq_hors_ccp", "top_det_gam_autre", "srf_fnc_inst_tr", "top_det_certicode", "top_det_certicode_plus",
+    "mnt_crd_credit_immo", "mnt_crd_credit_perso", "mnt_epa_disp", "mnt_epa_non_disp", "nbr_cnt_tot", "nbr_gam_tot", "recence_dernier_ach", "srf_ass_vie", "srf_ccp_moyen", "srf_epa_log", "srf_epa_ord", "srf_fnc_inst", "srf_val_mob" 
+]
+
+relation_metrics = ["top_id_bel", "nbr_rdv_pgm_faf", "nbr_rdv_pgm_tel", "nbr_rdv_sptn_faf", "nbr_rdv_sptn_tel", "nbr_con_appel_srv_vocal", "nbr_contact_gui", "nbr_appel_cf"]
+
+epargne_metrics = ["nbr_cnt_cel", "nbr_cnt_ldd", "nbr_cnt_lep", "nbr_cnt_livret_a", "nbr_cnt_livret_b", "nbr_cnt_livret_jeune", "nbr_cnt_pel", "top_au_plafond_livret_a", "top_au_plafond_livret_jeune", "top_au_plafond_ldd", "top_au_plafond_lep", "top_au_plafond_cel", "top_au_plafond_pel",
+    "mnt_encours_cel", "mnt_encours_ldd", "mnt_encours_lep", "mnt_encours_livret_a", "mnt_encours_livret_b", "mnt_encours_livret_jeune", "mnt_encours_pel"
+]
+
+aq_metrics = ["nbr_cnt_ccp", "top_mono_det_ccp", "nbr_cnt_chequier", "nbr_cnt_formule", "nbr_cnt_formule_simple"]
+
+CP_metrics = ["nbr_cnt_projet", "nbr_cnt_travaux", "nbr_cnt_auto_credit", "nbr_cnt_etudiant", "nbr_cnt_rachat", "nbr_cnt_autres_perso", "nbr_cnt_micro", "nbr_cnt_renouvelable", "mnt_crd_projet", "mnt_crd_travaux", "mnt_crd_auto_credit", "mnt_crd_etudiant", "mnt_crd_rachat", "mnt_crd_autres_perso", "mnt_crd_micro", "mnt_crd_renouvelable"]
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+top_aq = ['nbr_cnt_ccp', 'nbr_cnt_chequier', 'nbr_cnt_formule', 'nbr_cnt_formule_simple' ]
+top_epargne = ['nbr_cnt_cel', 'nbr_cnt_ldd', 'nbr_cnt_lep', 'nbr_cnt_livret_a', 'nbr_cnt_livret_b',
+               'nbr_cnt_livret_jeune', 'nbr_cnt_pel']
+top_cp = ['nbr_cnt_projet', 'nbr_cnt_travaux', 'nbr_cnt_auto_credit',
+               'nbr_cnt_etudiant', 'nbr_cnt_rachat', 'nbr_cnt_autres_perso', 'nbr_cnt_renouvelable']
+
+# Lecture des datasets
+BDD_edixit_data = dataiku.Dataset("BDD_edixit_data")
+BDD_edixit_data_df = dkuspark.get_dataframe(sqlContext, BDD_edixit_data)
+
+bloc_socio_dem_cur_ext = dataiku.Dataset("bloc_socio_dem_cur_ext")
+bloc_socio_dem_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_socio_dem_cur_ext)
+bloc_socio_dem_cur_ext_df = bloc_socio_dem_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+socio_metrics)
+bloc_socio_dem_cur_ext_df = (
+    bloc_socio_dem_cur_ext_df
+    .withColumn("lb_ptf_conseiller",
+        F.when(F.col("cd_ptf") == "00", "PTF_00")
+        .when(F.col("cd_ptf").isin("01", "02", "03", "04", "05", "06", "07", "08"), "CAPM")
+        .when(F.col("cd_ptf") == "09", "CBP")
+        .when(F.col("cd_ptf") == "10", "PTF_10")
+        .when(F.col("cd_ptf").isin("11", "12", "13", "14", "15", "16"), "CA")
+        .when(F.col("cd_ptf").isin("17", "18"), "DACB")
+        .when(F.col("cd_ptf") == "19", "RCPART")
+        .when(F.col("cd_ptf").isin("20", "21", "22", "23", "24", "25", "26", "27", "28"), "CAEP_secteur")
+        .when(F.col("cd_ptf") == "29", "CAEP_territoire")
+        .otherwise("NR")
+    )
+    #.drop("cd_ptf")
+)
+
+bloc_seg_cur_ext = dataiku.Dataset("bloc_seg_cur_ext")
+bloc_seg_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_seg_cur_ext)
+bloc_seg_cur_ext_df = bloc_seg_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+seg_metrics)
+
+bloc_equipement_cur_ext = dataiku.Dataset("bloc_equipement_cur_ext")
+bloc_equipement_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_equipement_cur_ext)
+bloc_equipement_cur_ext_df = bloc_equipement_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+equip_metrics)
+
+bloc_relation_client_cur_ext = dataiku.Dataset("bloc_relation_client_cur_ext")
+bloc_relation_client_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_relation_client_cur_ext)
+bloc_relation_client_cur_ext_df = bloc_relation_client_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+relation_metrics)
+
+bloc_epargne_cur_ext = dataiku.Dataset("bloc_epargne_cur_ext")
+bloc_epargne_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_epargne_cur_ext)
+bloc_epargne_cur_ext_df = bloc_epargne_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+epargne_metrics)
+
+for col in [x for x in bloc_epargne_cur_ext_df.columns if x in top_epargne]:
+    bloc_epargne_cur_ext_df = (
+        bloc_epargne_cur_ext_df
+        .withColumn('top_det_'+col[8:], F.when(F.col(col)>0, 'OUI').otherwise('NON'))
+        #.drop(col)
+    )
+
+bloc_aq_cur_ext = dataiku.Dataset("bloc_aq_cur_ext")
+bloc_aq_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_aq_cur_ext)
+bloc_aq_cur_ext_df = bloc_aq_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+aq_metrics)
+
+for col in [x for x in bloc_aq_cur_ext_df.columns if x in top_aq]:
+    bloc_aq_cur_ext_df = (
+        bloc_aq_cur_ext_df
+        .withColumn('top_det_'+col[8:], F.when(F.col(col)>0, 'OUI').otherwise('NON'))
+        #.drop(col)
+    )
+
+bloc_credit_perso_cur_ext = dataiku.Dataset("bloc_credit_perso_cur_ext")
+bloc_credit_perso_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_credit_perso_cur_ext)
+bloc_credit_perso_cur_ext_df = bloc_credit_perso_cur_ext_df.filter(
+    (F.col("annee_mois_part") >= DATE_deb_perim) &
+    (F.col("annee_mois_part") <= DATE_fin_perim)
+).select(["id_prs", "annee_mois_part"]+CP_metrics)
+
+# Travailler les TOP
+# On transforme toutes nos variables indiquant un nombre par un top: OUI ou NON
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+for col in [x for x in bloc_credit_perso_cur_ext_df.columns if x in top_cp]:
+    bloc_credit_perso_cur_ext_df = (
+        bloc_credit_perso_cur_ext_df
+        .withColumn('top_det_'+col[8:], F.when(F.col(col)>0, 'OUI').otherwise('NON'))
+        #.drop(col)
+    )
+
+
+pnb_cur_ext = dataiku.Dataset("pnb_cur_ext")
+pnb_cur_ext_df = dkuspark.get_dataframe(sqlContext, pnb_cur_ext)
+pnb_cur_ext_df = pnb_cur_ext_df.filter(
+    (F.col("annee_regle_part") == '2024_RG2024') |
+    (F.col("annee_regle_part") == '.')
+)
+
+# Cache des DataFrames pour optimisation
+bloc_socio_dem_cur_ext_df.cache()
+bloc_seg_cur_ext_df.cache()
+bloc_equipement_cur_ext_df.cache()
+bloc_relation_client_cur_ext_df.cache()
+bloc_epargne_cur_ext_df.cache()
+bloc_aq_cur_ext_df.cache()
+bloc_credit_perso_cur_ext_df.cache()
+
+# 1. Préparation de BDD_edixit_data_df
+beneficiaires_eDixit_df = (
+    BDD_edixit_data_df
+    .filter(F.col("Date_debut_entretien").contains("2025"))
+    .withColumn(
+        "entretien_mois",
+        F.when(
+            F.col("Date_debut_entretien").isNotNull(),
+            F.date_format(
+                F.to_date(F.col("Date_debut_entretien"), "dd/MM/yyyy HH:mm"),
+                "yyyyMM"
+            ).cast("int")
+        ).otherwise(None)
+    )
+    .withColumnRenamed("Custom_Id_du_dossier", "id_prs_edixit")
+)
+
+# Garder seulement le RDV le plus récent par id_prs
+window_spec = Window.partitionBy("id_prs_edixit").orderBy(F.col("entretien_mois").desc())
+beneficiaires_eDixit_df = (
+    beneficiaires_eDixit_df
+    .withColumn("rank", F.row_number().over(window_spec))
+    .filter(F.col("rank") == 1)
+    .drop("rank")
+)
+
+# ============================================================
+# Fonction pour transformer un YYYYMM en vraie date
+# ============================================================
+# Exemple :
+# "202501" -> 2025-01-01
+# "202512" -> 2025-12-01
+#
+# Cela permet ensuite d'utiliser add_months() correctement,
+# notamment lors des changements d'année.
+# ============================================================
+
+def yyyymm_to_date(col_name):
+    return F.to_date(
+        F.concat(
+            F.col(col_name).cast("string"),
+            F.lit("01")
+        ),
+        "yyyyMMdd"
+    )
+
+
+# ============================================================
+# 2. Fonction pour récupérer les métriques à un horizon donné
+# ============================================================
+
+def get_metrics_at_horizon(base_df, horizon, suffix):
+
+    # --------------------------------------------------------
+    # Bloc marketing :
+    # annee_mois_part est en YYYYMM
+    # On le transforme en vraie date puis on décale de
+    # "horizon" mois par rapport au mois marketing.
+    # --------------------------------------------------------
+
+    marketing = (
+        base_df
+        .withColumn(
+            "_mois_date",
+            yyyymm_to_date("annee_mois_part")
+        )
+        .withColumn(
+            "_target_date",
+            F.add_months(
+                F.col("_mois_date"),
+                horizon
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # Données d'entretien :
+    # entretien_mois est également en YYYYMM
+    # --------------------------------------------------------
+
+    entretiens = (
+        beneficiaires_eDixit_df
+        .withColumn(
+            "_entretien_date",
+            yyyymm_to_date("entretien_mois")
+        )
+    )
+
+    # --------------------------------------------------------
+    # Jointure :
+    #
+    # id_prs du bloc marketing
+    # =
+    # id_prs_edixit du bénéficiaire
+    #
+    # ET
+    #
+    # mois marketing décalé de "horizon"
+    # =
+    # mois d'entretien
+    #
+    # Exemple :
+    # entretien = 202501
+    #
+    # horizon 0 -> marketing 202501
+    # horizon 1 -> marketing 202502
+    # horizon 3 -> marketing 202504
+    # horizon 6 -> marketing 202507
+    # --------------------------------------------------------
+
+    result = (
+        marketing
+        .join(
+            entretiens.select(
+                "id_prs_edixit",
+                "_entretien_date"
+            ),
+            (
+                F.col("id_prs") == F.col("id_prs_edixit")
+            )
+            &
+            (
+                F.col("_target_date") == F.col("_entretien_date")
+            ),
+            "inner"
+        )
+        .drop(
+            "id_prs_edixit",
+            "_mois_date",
+            "_target_date",
+            "_entretien_date"
+        )
+    )
+
+    return result
+
+
+# ============================================================
+# 3. Définition des horizons
+# ============================================================
+#
+# ATTENTION :
+# Ici on considère :
+#
+# _M = mois de l'entretien
+# _M1 = 1 mois après
+# _M3 = 3 mois après
+# _M6 = 6 mois après
+#
+# Donc surtout pas (-1, "_M1") :
+# (-1) correspondrait à un mois AVANT l'entretien.
+# ============================================================
+
+cohort_suffixes = [
+    (0, "M"),
+    (1, "M1"),
+    (3, "M3"),
+    (6, "M6")
+]
+
+
+# 4. Préparation des métriques pour chaque horizon
+# Bloc socio-démographique
+socio_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    socio_dfs[suffix] = get_metrics_at_horizon(
+        bloc_socio_dem_cur_ext_df.select(["id_prs", "annee_mois_part"] + socio_metrics+["lb_ptf_conseiller"]),
+        horizon,
+        suffix
+    )
+    for col_name in socio_metrics+["lb_ptf_conseiller"]:
+        socio_dfs[suffix] = socio_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# Bloc segmentation
+#.withColumnRenamed("cd_seg_com_top_frag","nbr_fragile")
+seg_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    seg_dfs[suffix] = get_metrics_at_horizon(
+        bloc_seg_cur_ext_df.select(["id_prs", "annee_mois_part"] + seg_metrics),
+        horizon,
+        suffix
+    )
+    for col_name in seg_metrics:
+        seg_dfs[suffix] = seg_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# Bloc équipement
+equip_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    equip_dfs[suffix] = get_metrics_at_horizon(
+        bloc_equipement_cur_ext_df.select(["id_prs", "annee_mois_part"] + equip_metrics),
+        horizon,
+        suffix
+    )
+    for col_name in equip_metrics:
+        equip_dfs[suffix] = equip_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# Bloc relation client
+relation_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    relation_dfs[suffix] = get_metrics_at_horizon(
+        bloc_relation_client_cur_ext_df.select(["id_prs", "annee_mois_part"] + relation_metrics),
+        horizon,
+        suffix
+    )
+    for col_name in relation_metrics:
+        relation_dfs[suffix] = relation_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# Bloc épargne
+epargne_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    epargne_dfs[suffix] = get_metrics_at_horizon(
+        bloc_epargne_cur_ext_df.select(["id_prs", "annee_mois_part"] + epargne_metrics+['top_det_cel', 'top_det_ldd', 'top_det_lep', 'top_det_livret_a', 'top_det_livret_b',
+               'top_det_livret_jeune', 'top_det_pel']),
+        horizon,
+        suffix
+    )
+    for col_name in epargne_metrics+['top_det_cel', 'top_det_ldd', 'top_det_lep', 'top_det_livret_a', 'top_det_livret_b',
+               'top_det_livret_jeune', 'top_det_pel']:
+        epargne_dfs[suffix] = epargne_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# BLOC ARGENT QUOTIDIEN
+aq_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    aq_dfs[suffix] = get_metrics_at_horizon(
+        bloc_aq_cur_ext_df.select(["id_prs", "annee_mois_part"] + aq_metrics+['top_det_ccp', 'top_det_chequier', 'top_det_formule', 'top_det_formule_simple' ]),
+        horizon,
+        suffix
+    )
+    for col_name in aq_metrics+['top_det_ccp', 'top_det_chequier', 'top_det_formule', 'top_det_formule_simple' ]:
+        aq_dfs[suffix] = aq_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+
+# BLOC CREDIT PERSO
+cp_dfs = {}
+for horizon, suffix in cohort_suffixes:
+    cp_dfs[suffix] = get_metrics_at_horizon(
+        bloc_credit_perso_cur_ext_df.select(["id_prs", "annee_mois_part"] + CP_metrics+['top_det_projet', 'top_det_travaux', 'top_det_auto_credit',
+               'top_det_etudiant', 'top_det_rachat', 'top_det_autres_perso', 'top_det_renouvelable']),
+        horizon,
+        suffix
+    )
+    for col_name in CP_metrics+['top_det_projet', 'top_det_travaux', 'top_det_auto_credit',
+               'top_det_etudiant', 'top_det_rachat', 'top_det_autres_perso', 'top_det_renouvelable']:
+        cp_dfs[suffix] = cp_dfs[suffix].withColumnRenamed(col_name, f"{col_name}_{suffix}")
+        
+# 5. Traitement du PNB (annuel)
+pnb_cur_ext_df = (
+    pnb_cur_ext_df
+    #.filter((F.col("annee_regle_part") == '2024_RG2024') | (F.col("annee_regle_part") == '.'))
+    .withColumn("pnb_tr",
+        F.when((F.col("pnb_ok_bilan") < 0) & (F.col("pnb_ok_bilan").isNotNull()), "01_moins_de_0euro")
+        .when((F.col("pnb_ok_bilan") >= 0) & (F.col("pnb_ok_bilan") < 50), "02_0_a_50euros")
+        .when((F.col("pnb_ok_bilan") >= 50) & (F.col("pnb_ok_bilan") < 100), "03_50_a_100euros")
+        .when((F.col("pnb_ok_bilan") >= 100) & (F.col("pnb_ok_bilan") < 150), "04_100_a_150euros")
+        .when((F.col("pnb_ok_bilan") >= 150) & (F.col("pnb_ok_bilan") < 200), "05_150_a_200euros")
+        .when((F.col("pnb_ok_bilan") >= 200) & (F.col("pnb_ok_bilan") < 300), "06_200_a_300euros")
+        .when((F.col("pnb_ok_bilan") >= 300) & (F.col("pnb_ok_bilan") < 500), "07_300_a_500euros")
+        .when((F.col("pnb_ok_bilan") >= 500) & (F.col("pnb_ok_bilan") < 1000), "08_500_a_1Keuros")
+        .when((F.col("pnb_ok_bilan") >= 1000), "09_plus_de_1Keuro")
+        .otherwise("00_Non_renseigné")
+    )
+    .select("id_prs", "pnb_ok_bilan", "pnb_tr", "annee_regle_part")
+)
+
+pnb_2024_df = pnb_cur_ext_df.filter(F.col("annee_regle_part") == '2024_RG2024').withColumnRenamed("pnb_tr", "pnb_tr_2024").withColumnRenamed("pnb_ok_bilan", "pnb_ok_bilan_2024").drop("annee_regle_part")
+pnb_2025_df = pnb_cur_ext_df.filter(F.col("annee_regle_part") == '.').withColumnRenamed("pnb_tr", "pnb_tr_2025").withColumnRenamed("pnb_ok_bilan", "pnb_ok_bilan_2025").drop("annee_regle_part")
+
+# 6. Jointure de tous les DataFrames pour les bénéficiaires
+table_principale = beneficiaires_eDixit_df
+
+# Joindre les métriques socio-démographiques
+for suffix in ["M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        socio_dfs[suffix],
+        table_principale.id_prs_edixit == socio_dfs[suffix].id_prs,
+        "left"
+    ).drop(socio_dfs[suffix].id_prs)
+
+# Joindre les métriques segmentation
+for suffix in ["M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        seg_dfs[suffix],
+        table_principale.id_prs_edixit == seg_dfs[suffix].id_prs,
+        "left"
+    ).drop(seg_dfs[suffix].id_prs)
+
+# Joindre les métriques équipement
+for suffix in ["M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        equip_dfs[suffix],
+        table_principale.id_prs_edixit == equip_dfs[suffix].id_prs,
+        "left"
+    ).drop(equip_dfs[suffix].id_prs)
+
+# Joindre les métriques relation client
+for suffix in [ "M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        relation_dfs[suffix],
+        table_principale.id_prs_edixit == relation_dfs[suffix].id_prs,
+        "left"
+    ).drop(relation_dfs[suffix].id_prs)
+
+# Joindre les métriques épargne
+for suffix in [ "M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        epargne_dfs[suffix],
+        table_principale.id_prs_edixit == epargne_dfs[suffix].id_prs,
+        "left"
+    ).drop(epargne_dfs[suffix].id_prs)
+# Joindre les métriques aq
+for suffix in [ "M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        aq_dfs[suffix],
+        table_principale.id_prs_edixit == aq_dfs[suffix].id_prs,
+        "left"
+    ).drop(aq_dfs[suffix].id_prs)
+# Joindre les métriques CP
+for suffix in [ "M", "M1", "M3", "M6"]:
+    table_principale = table_principale.join(
+        cp_dfs[suffix],
+        table_principale.id_prs_edixit == cp_dfs[suffix].id_prs,
+        "left"
+    ).drop(cp_dfs[suffix].id_prs)
+
+# Joindre les PNB 2024 et 2025
+table_principale = table_principale.join(
+    pnb_2024_df,
+    table_principale.id_prs_edixit == pnb_2024_df.id_prs,
+    "left"
+).drop("id_prs")
+
+table_principale = table_principale.join(
+    pnb_2025_df,
+    table_principale.id_prs_edixit == pnb_2025_df.id_prs,
+    "left"
+).drop("id_prs")
+
+# PARTIE NON BENEFICIAIRES
+# ====================================================
+
+# 1. Identifier les clients CAEP en 2025 (au moins un mois)
+CAEP_2025 = (
+    bloc_socio_dem_cur_ext_df
+    .filter(
+        (F.col("annee_mois_part") >= 202501) &
+        (F.col("annee_mois_part") <= 202512) &
+        (F.col("lb_ptf_conseiller").isin("CAEP_secteur", "CAEP_territoire"))
+    )
+    .select(
+        F.col("id_prs").alias("id_prs_caep"),  # Renommage pour éviter ambiguïté
+        F.col("annee_mois_part").alias("annee_mois_caep")  # Renommage pour éviter ambiguïté
+    )
+    .distinct()
+)
+
+# 2. Identifier les clients avec un RDV (via bloc_relation_client_cur_ext)
+clients_avec_RDV = (
+    bloc_relation_client_cur_ext_df
+    .filter(
+        (F.col("annee_mois_part") >= 202501) &
+        (F.col("annee_mois_part") <= 202512) &
+        ((F.col("nbr_rdv_pgm_faf") >= 1) |
+        (F.col("nbr_rdv_pgm_tel") >= 1) |
+        (F.col("nbr_rdv_sptn_faf") >= 1) |
+        (F.col("nbr_rdv_sptn_tel") >= 1))
+    )
+    .select(
+        F.col("id_prs").alias("id_prs_rdv"),  # Renommage pour éviter ambiguïté
+        F.col("annee_mois_part").alias("annee_mois_rdv")  # Renommage pour éviter ambiguïté
+    )
+    .distinct()
+)
+
+# 3. Joindre CAEP et RDV pour trouver les clients CAEP avec RDV
+# Utilisation des noms explicites pour éviter toute ambiguïté
+CAEP_avec_RDV = (
+    CAEP_2025
+    .join(
+        clients_avec_RDV,
+        (F.col("id_prs_caep") == F.col("id_prs_rdv")) &
+        (F.col("annee_mois_caep") == F.col("annee_mois_rdv")),
+        "inner"
+    )
+    .drop("id_prs_rdv", "annee_mois_rdv")  # Suppression des colonnes renommées
+    .withColumnRenamed("id_prs_caep", "id_prs")  # Retour au nom original
+    .withColumnRenamed("annee_mois_caep", "annee_mois_part")
+    .distinct()
+)
+
+# 4. Garder uniquement le RDV le plus récent pour chaque client
+window_spec = Window.partitionBy("id_prs").orderBy(F.col("annee_mois_part").desc())
+non_benef_RDV_recent = (
+    CAEP_avec_RDV
+    .withColumn("rank", F.row_number().over(window_spec))
+    .filter(F.col("rank") == 1)
+    .drop("rank")
+    .withColumnRenamed("annee_mois_part", "entretien_mois")
+)
+
+# 5. Exclure les bénéficiaires eDixit
+non_benef_RDV_ref = (
+    non_benef_RDV_recent
+    .join(
+        beneficiaires_eDixit_df.select("id_prs_edixit"),
+        F.col("id_prs") == F.col("id_prs_edixit"),
+        "left_anti"
+    )
+    .drop("id_prs_edixit")
+    .withColumnRenamed("id_prs", "id_prs_non_benef")
+)
+
+# 6. Fonction pour créer les cohortes (adaptée pour les non-bénéficiaires)
+def create_cohort_table(base_df, reference_df, id_col, date_col, metrics, cohort_suffixes):
+    cohort_dfs = {}
+
+    # Entretien -> vraie date (une seule fois)
+    reference_norm = reference_df.select(
+        "id_prs_non_benef",
+        F.to_date(F.col("entretien_mois").cast("string"), "yyyyMM").alias("entretien_date"),
+    )
+
+    # Mois marketing -> vraie date (une seule fois)
+    base_norm = base_df.withColumn(
+        "marketing_date",
+        F.to_date(F.col(date_col).cast("string"), "yyyyMM"),
+    )
+
+    for horizon, suffix in cohort_suffixes:
+        # mois marketing visé = mois d'entretien + horizon (APRÈS l'entretien)
+        ref_target = reference_norm.withColumn(
+            "target_date", F.add_months(F.col("entretien_date"), horizon)
+        )
+
+        cohort = (
+            base_norm.join(
+                ref_target,
+                (F.col(id_col) == F.col("id_prs_non_benef"))
+                & (F.col("marketing_date") == F.col("target_date")),
+                "inner",
+            )
+            .drop("id_prs_non_benef", "entretien_date", "target_date", "marketing_date", date_col)
+        )
+
+        for metric in metrics:
+            cohort = cohort.withColumnRenamed(metric, f"{metric}_{suffix}")
+
+        cohort_dfs[suffix] = cohort
+
+    return cohort_dfs
+"""
+def create_cohort_table(base_df, reference_df, id_col, date_col, metrics, cohort_suffixes):
+    cohort_dfs = {}
+    for horizon, suffix in cohort_suffixes:
+        cohort_dfs[suffix] = (
+            base_df
+            .withColumn("target_mois", F.col(date_col) + horizon)
+            .join(
+                reference_df.select("id_prs_non_benef", "entretien_mois"),
+                (F.col(id_col) == F.col("id_prs_non_benef")) &
+                (F.col("target_mois") == F.col("entretien_mois")),
+                "inner"
+            )
+            .drop("id_prs_non_benef", "entretien_mois", "target_mois", date_col)
+        )
+        for metric in metrics:
+            cohort_dfs[suffix] = cohort_dfs[suffix].withColumnRenamed(metric, f"{metric}_{suffix}")
+    return cohort_dfs
+"""
+# 7. Table principale pour les non-bénéficiaires
+non_benef_table = non_benef_RDV_ref
+
+# Ajouter cohortes socio-démographiques
+non_socio_cohorts = create_cohort_table(
+    bloc_socio_dem_cur_ext_df.select(["id_prs", "annee_mois_part"] + socio_metrics+["lb_ptf_conseiller"]),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", socio_metrics+["lb_ptf_conseiller"], cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_socio_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_socio_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_socio_cohorts[suffix].id_prs)
+
+# Ajouter cohortes segmentation
+non_seg_cohorts = create_cohort_table(
+    bloc_seg_cur_ext_df.select(["id_prs", "annee_mois_part"] + seg_metrics),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", seg_metrics, cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_seg_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_seg_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_seg_cohorts[suffix].id_prs)
+
+# Ajouter cohortes équipement
+non_equip_cohorts = create_cohort_table(
+    bloc_equipement_cur_ext_df.select(["id_prs", "annee_mois_part"] + equip_metrics),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", equip_metrics, cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_equip_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_equip_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_equip_cohorts[suffix].id_prs)
+
+# Ajouter cohortes relation client
+non_relation_cohorts = create_cohort_table(
+    bloc_relation_client_cur_ext_df.select(["id_prs", "annee_mois_part"] + relation_metrics),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", relation_metrics, cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_relation_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_relation_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_relation_cohorts[suffix].id_prs)
+
+# Ajouter cohortes épargne
+non_epargne_cohorts = create_cohort_table(
+    bloc_epargne_cur_ext_df.select(["id_prs", "annee_mois_part"] + epargne_metrics+['top_det_cel', 'top_det_ldd', 'top_det_lep', 'top_det_livret_a', 'top_det_livret_b',
+               'top_det_livret_jeune', 'top_det_pel']),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", epargne_metrics+['top_det_cel', 'top_det_ldd', 'top_det_lep', 'top_det_livret_a', 'top_det_livret_b',
+               'top_det_livret_jeune', 'top_det_pel'], cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_epargne_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_epargne_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_epargne_cohorts[suffix].id_prs)
+    
+#AQ
+# Ajouter cohortes aq
+non_aq_cohorts = create_cohort_table(
+    bloc_aq_cur_ext_df.select(["id_prs", "annee_mois_part"] + aq_metrics+['top_det_ccp', 'top_det_chequier', 'top_det_formule', 'top_det_formule_simple' ]),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", aq_metrics+['top_det_ccp', 'top_det_chequier', 'top_det_formule', 'top_det_formule_simple' ], cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_aq_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_aq_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_aq_cohorts[suffix].id_prs)
+    
+# Ajouter cohortes CP
+non_cp_cohorts = create_cohort_table(
+    bloc_credit_perso_cur_ext_df.select(["id_prs", "annee_mois_part"] + CP_metrics+['top_det_projet', 'top_det_travaux', 'top_det_auto_credit',
+               'top_det_etudiant', 'top_det_rachat', 'top_det_autres_perso', 'top_det_renouvelable']),
+    non_benef_RDV_ref,
+    "id_prs", "annee_mois_part", CP_metrics+['top_det_projet', 'top_det_travaux', 'top_det_auto_credit',
+               'top_det_etudiant', 'top_det_rachat', 'top_det_autres_perso', 'top_det_renouvelable'], cohort_suffixes
+)
+for suffix in [ "M", "M1", "M3", "M6"]:
+    non_benef_table = non_benef_table.join(
+        non_cp_cohorts[suffix],
+        non_benef_table.id_prs_non_benef == non_cp_cohorts[suffix].id_prs,
+        "left"
+    ).drop(non_cp_cohorts[suffix].id_prs)
+
+# Ajouter PNB
+non_benef_table = non_benef_table.join(
+    pnb_2024_df.withColumnRenamed("id_prs", "id_prs_pnb"),
+    non_benef_table.id_prs_non_benef == F.col("id_prs_pnb"),
+    "left"
+).drop("id_prs_pnb")
+
+non_benef_table = non_benef_table.join(
+    pnb_2025_df.withColumnRenamed("id_prs", "id_prs_pnb"),
+    non_benef_table.id_prs_non_benef == F.col("id_prs_pnb"),
+    "left"
+).drop("id_prs_pnb")
+
+# 8. Écrire la table des non-bénéficiaires
+non_benef_cohortes_output = dataiku.Dataset("non_beneficiaires_CAEP_RDV_cohortes")
+dkuspark.write_with_schema(non_benef_cohortes_output, non_benef_table)
+
+# 8. Écrire les tables de sortie
+# Table principale des bénéficiaires
+table_principale_output = dataiku.Dataset("table_principale")
+dkuspark.write_with_schema(table_principale_output, table_principale)
