@@ -1,0 +1,621 @@
+recipe 1: perimetre clients
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+import unicodedata
+import dataiku
+from pyspark.sql.types import *
+from dataiku import spark as dkuspark
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql import SparkSession, HiveContext
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+import random
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
+from pyspark.sql.functions import expr, rank
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+sparkSession = (SparkSession
+                .builder.appName('Perimetre_contrat')
+                .master('yarn-client')
+                .config("spark.driver.maxResultSize", '2g')
+                .config('spark.driver.memory', '2g')
+                .config('spark.executor.memory', '2g')
+                .config('spark.executor.instances', 5)
+                .config('spark.sql.autoBroadcastJoinThreshold',-1)
+                .enableHiveSupport()
+                .getOrCreate()
+               )
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Tables sources et Dates à laquelle on veut réaliser les études des clients
+
+borne_inf = "20260101"
+borne_sup = "20260630"
+date_part_sup = "202606"
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Read recipe inputs
+bloc_contrat = dataiku.Dataset("bloc_contrat_cur_ext")
+bloc_contrat = dkuspark.get_dataframe(sqlContext, bloc_contrat)
+
+bloc_seg = dataiku.Dataset("bloc_seg_cur_ext")
+bloc_seg = dkuspark.get_dataframe(sqlContext, bloc_seg)
+
+bloc_gammes_produits = dataiku.Dataset("bloc_gammes_produits_cur_ext")
+bloc_gammes_produits = dkuspark.get_dataframe(sqlContext, bloc_gammes_produits)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+filtre_gamme = (
+    ((F.col("gamme") == "AQ") & (F.col("sous_gamme") == "CCP")) |
+    #((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "CAT")) |
+    #((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "COMPTE_ATTENTE")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "COMPTE_SUR_LIVRET")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "LDD")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "LEP")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "LIVRET_A")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "LIVRET_B")) |
+    ((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "LIVRET_JEUNE")) |
+    #((F.col("gamme") == "EPA_ORD") & (F.col("sous_gamme") == "PEP")) |
+    ((F.col("gamme") == "EPA_LOG") & (F.col("sous_gamme") == "CEL")) |
+    #((F.col("gamme") == "EPA_LOG") & (F.col("sous_gamme") == "COMPOSE")) |
+    #((F.col("gamme") == "EPA_LOG") & (F.col("sous_gamme") == "PEL"))
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+gammes_produits = (
+    bloc_gammes_produits
+    .filter((F.col("annee_mois_part") == date_part_sup) & filtre_gamme) # Sinon redondance des sous_gammes
+    .select('cd_cnt_typ', 'gamme', 'sous_gamme')
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+bloc_contrat_annee = (
+    bloc_contrat
+    .filter((F.col("annee_mois_part") >= borne_inf)
+            & (F.col("annee_mois_part") <= borne_sup)
+           )
+    .select('id_prs', 'num_cnt_com', 'cd_cnt_typ', 'cd_typ_ttl', 'nbr_titulaire', 'annee_mois_part')
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+bloc_seg_annee = (
+    bloc_seg
+    .filter((F.col("annee_mois_part") >= borne_inf) &
+            (F.col("annee_mois_part") <= borne_sup) &
+            (F.col("cd_seg_com_top_dcd") == 0)
+           )
+    .select('id_prs', 'annee_mois_part')
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+perimetre_client = (
+    bloc_contrat_annee
+    .join(bloc_seg_annee, on=['id_prs', 'annee_mois_part'], how='inner')
+    .join(gammes_produits, on=['cd_cnt_typ'], how='inner')
+    .join(gammes_produits_ccepargne, on=['cd_cnt_typ'], how='inner')
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+windowSpec = Window.partitionBy('id_prs','num_cnt_com').orderBy(F.col("annee_mois_part").desc())
+
+dernier_vision = (
+    perimetre_client
+        .select('id_prs','num_cnt_com','annee_mois_part').distinct()
+        .withColumn("rank",rank().over(windowSpec))
+        .filter(F.col("rank")==1)
+        .drop("rank")
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+perimetre_client_vf = (
+    perimetre_client
+    .join(dernier_vision, on=['id_prs','num_cnt_com','annee_mois_part'], how='inner')
+)
+
+
+
+
+# Write recipe outputs
+perimetre_clients_epargne = dataiku.Dataset("perimetre_clients_epargne")
+dkuspark.write_with_schema(perimetre_clients_epargne, perimetre_clients_epargne_df)
+
+recipe 2: virements instantanées
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+import unicodedata
+import dataiku
+from pyspark.sql.types import *
+from dataiku import spark as dkuspark
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql import SparkSession, HiveContext
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+import random
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
+from pyspark.sql.functions import expr
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+sparkSession = (SparkSession
+                .builder.appName('CAC_hub_download')
+                .master('yarn-client')
+                .config("spark.driver.maxResultSize", '8g')
+                .config('spark.driver.memory', '8g')
+                .config('spark.executor.memory', '8g')
+                .config('spark.executor.instances', 30)
+                .config('spark.sql.autoBroadcastJoinThreshold',-1)
+                .enableHiveSupport()
+                .getOrCreate()
+               )
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+PROJECT_KEY = dataiku.default_project_key() # Nom du projet dans lequel on se trouve
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# Tables sources et Dates à laquelle on veut réaliser les études des clients
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#VARIABLES
+borne_inf = "20260101"
+borne_sup = "20260630"
+date_part = 202601
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# L'objet de ce notebook est d'obtenir tous les virements instantanés sous format émis et reçus.
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Read recipe inputs
+t_dlk_pivot_legacy = dataiku.Dataset("t_dlk_pivot_legacy")
+t_dlk_pivot_legacy = dkuspark.get_dataframe(sqlContext, t_dlk_pivot_legacy)
+
+perimetre_contrat = dataiku.Dataset("perimetre_contrat")
+perimetre_contrat = dkuspark.get_dataframe(sqlContext, perimetre_contrat)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+perimetre_contrat = perimetre_contrat.drop("annee_mois_part")
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+table_virements_inst = (
+    t_dlk_pivot_legacy
+    .filter((F.col("dtprench") >= borne_inf)
+                 & (F.col("dtprench") <= borne_sup)
+                 & (F.col('date_part') >= date_part)
+                 & (F.col('norobext').isNotNull())
+                 & (F.col('typarten')!='E')
+           )
+    .withColumn('id_ope', F.trim(F.col('norobext')))
+    .withColumn('priority', F.when(F.col('cdidecro')=='PCI',1)
+                                 .when(F.col('cdidecro')=='ABN',2)
+                                 .when(F.col('cdidecro')=='EKO',3)
+                                 .when(F.col('cdidecro')=='RJT',4)
+                                 .when(F.col('cdidecro')=='IMP',5)
+                                 .when(F.col('cdidecro')=='RTI',6)
+                                 .when(F.col('cdidecro')=='NTR',7)
+                                 .when(F.col('cdidecro')=='ATC',8)
+                                 .when(F.col('cdidecro')=='ECH',9)
+                                 .otherwise(10)
+                    )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+window = Window.partitionBy('id_ope').orderBy(F.col('priority').asc())
+
+virements_inst = (
+    table_virements_inst
+    .withColumn('rank', F.rank().over(window))
+    .filter(F.col('rank') == 1)
+    .drop('rank')
+
+    .withColumn('iban',F.when(F.col('cdopeint')=='VIO', F.col('cdibaemt'))
+                        .when(F.col('cdopeint')=='VIB', F.col('cdibades'))
+               )
+    .withColumn('sens_operation',F.when((F.col('cdopeint')=='VIO'), "E")
+                                  .when((F.col('cdopeint')=='VIB'), "R")
+               )
+    .withColumn('num_cnt_com', F.substring('iban', 15, 11)
+               )
+    .withColumn('nature_compte', F.when(F.substring('iban', 5, 5)=='10011','EPA').otherwise('CCP')
+                )
+    .withColumn('montant', F.col('mtoperat1_calc') / 100)
+    .withColumn('rejet', F.when(F.col('cdidecro').isin('PCI', 'NTR', 'RJT', 'ABN', 'EKO'), 'Rejeté')
+                          .otherwise('Non rejeté')
+                )
+    .withColumn("annee_mois_part", F.substring('dtprench', 0,6))
+    .withColumnRenamed("dtprench", "date_execution")
+
+    .withColumn('canal_acquisition_operation', F.trim(F.col('cdcanacq')))
+    .withColumn("canal", F.when(F.col("cdcanacq").isin("BEL","APP","P2P","TPP"),"BEL")
+                          .otherwise(F.col("cdcanacq"))
+               )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+virements_inst_vf = (
+    virements_inst
+    .join(perimetre_contrat, on=['num_cnt_com'], how='inner')
+    .withColumn('poids', F.when(F.col("nbr_titulaire") >= 2, 0.5).otherwise(1))
+    .select('id_prs', 'num_cnt_com', 'gamme', 'sous_gamme', 'id_ope', 'sens_operation', 'poids', 'nmlibemt',
+            'cdtypemt', 'cdibaemt', 'cdbicemt', 'nmlibdes', 'cdtypdes', 'cdibades', 'cdbicdes', 'canal_acquisition_operation', 'canal',
+            'montant', 'date_execution', 'annee_mois_part') 
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# virements_inst_vf.persist()
+# virements_inst_vf.count()
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#La Banque Postale a deux codes banques possibles. On précise que l'IBAN doit commencer par FR
+#car sinon certains virements sont identifiés 'intra' à tort (N26 en Allemagne)
+
+est_intra_recus = (((F.substring(F.col("cdibaemt"), 5, 5) == "20041") |
+                   (F.substring(F.col("cdibaemt"), 5, 5) == "10011")) &
+                   (F.col('cdibaemt').startswith("FR")))
+
+est_intra_emis = (((F.substring(F.col("cdibades"), 5, 5) == "20041") |
+                   (F.substring(F.col("cdibades"), 5, 5) == "10011")) &
+                   (F.col('cdibades').startswith("FR")))
+
+est_doublon = ()
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+perimetre_contrat_gamme = (
+    perimetre_contrat
+    .select('num_cnt_com', 'gamme', 'sous_gamme')
+    .distinct()
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Virements émis
+Hub_inst_emis_df = (
+    virements_inst_vf
+    .filter(((F.col("sens_operation") == "E")) & (F.col('rejet')=='Non rejeté')) # Virements exécutés et émis
+    .withColumn('intra_inter', F.when(est_intra_emis, 'intra')
+                                .otherwise('inter'))
+    .withColumnRenamed('num_cnt_com', 'num_cnt_com_emt')
+    .withColumnRenamed('gamme', 'gamme_emt')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_emt')
+    .withColumn('num_cnt_com_des', F.when(est_intra_emis, F.substring('cdibades', 15, 11))
+                                    .otherwise(None))
+    .join(perimetre_contrat_gamme, F.col('num_cnt_com_des')== perimetre_contrat_gamme['num_cnt_com'], how='left')
+#     .distinct()
+    .withColumnRenamed('gamme', 'gamme_des')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_des')
+    .withColumn('nature_virement', F.when(((F.col('sous_gamme_emt') == "CCP") &
+                                          ((F.col('gamme_des') == 'EPA_ORD') | (F.col('gamme_des') == 'EPA_LOG'))),
+                                          'CCP_to_EPA')
+                                    .when((((F.col('gamme_emt') == 'EPA_ORD') | (F.col('gamme_emt') == 'EPA_LOG')) &
+                                            (F.col('sous_gamme_des') == "CCP")),
+                                          'EPA_to_CCP')
+                                    .when(((F.col('sous_gamme_emt') == "CCP") & (F.col('sous_gamme_des') == "CCP")),
+                                          'CCP_to_CCP')
+                                    .when((((F.col('gamme_emt') == "EPA_ORD") | (F.col('gamme_emt') == "EPA_LOG")) &
+                                          ((F.col('gamme_des') == "EPA_ORD") | (F.col('gamme_des') == "EPA_LOG"))),
+                                          'EPA_to_EPA')
+                                    .when(((F.col('intra_inter') == "intra") & (F.col('gamme_des').isNull())),
+                                          'Contrat_clos_et_autre'))
+                                    # Certains contrats n'ont pas de gamme, la plupart du temps c'est que ce sont des contrats clos
+
+    .select('id_prs', 'id_ope', 'poids', 'sens_operation', 'nature_virement', 'num_cnt_com_emt', 'gamme_emt',
+            'sous_gamme_emt', 'nmlibemt', 'cdtypemt', 'cdibaemt', 'cdbicemt', 'num_cnt_com_des', 'gamme_des', 'sous_gamme_des',
+            'nmlibdes', 'cdtypdes', 'cdibades', 'cdbicdes', 'intra_inter', 'canal_acquisition_operation', 'canal', 'montant',
+            'date_execution', 'annee_mois_part'
+           )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Virements reçus
+Hub_inst_recus_df = (
+    virements_inst_vf
+    .filter(((F.col("sens_operation") == "R")) & (F.col('rejet')=='Non rejeté')) # Virements exécutés et reçus
+    .filter(~est_intra_recus) # On enlève les intra pour éviter la redondance avec les virements émis
+    .withColumn('intra_inter', F.when(est_intra_recus, 'intra')
+                                .otherwise('inter'))
+    .withColumnRenamed('num_cnt_com', 'num_cnt_com_des')
+    .withColumnRenamed('gamme', 'gamme_des')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_des')
+    .withColumn('num_cnt_com_emt', F.when(est_intra_recus, F.substring('cdibaemt', 15, 11))
+                                    .otherwise(None))
+    .join(perimetre_contrat_gamme, F.col('num_cnt_com_emt') == perimetre_contrat_gamme['num_cnt_com'], how='left')
+    .withColumnRenamed('gamme', 'gamme_emt')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_emt')
+    .withColumn('nature_virement', F.when(((F.col('sous_gamme_emt') == "CCP") &
+                                          ((F.col('gamme_des') == 'EPA_ORD') | (F.col('gamme_des') == 'EPA_LOG'))),
+                                          'CCP_to_EPA')
+                                    .when((((F.col('gamme_emt') == 'EPA_ORD') | (F.col('gamme_emt') == 'EPA_LOG')) &
+                                            (F.col('sous_gamme_des') == "CCP")),
+                                          'EPA_to_CCP')
+                                    .when(((F.col('sous_gamme_emt') == "CCP") & (F.col('sous_gamme_des') == "CCP")),
+                                          'CCP_to_CCP')
+                                    .when((((F.col('gamme_emt') == "EPA_ORD") | (F.col('gamme_emt') == "EPA_LOG")) &
+                                          ((F.col('gamme_des') == "EPA_ORD") | (F.col('gamme_des') == "EPA_LOG"))),
+                                          'EPA_to_EPA')
+                                    .when(((F.col('intra_inter') == "intra") & (F.col('gamme_emt').isNull())),
+                                          'Contrat_clos_et_autre'))
+                                    # Certains contrats n'ont pas de gamme, la plupart du temps c'est que ce sont des contrats clos
+
+    .select('id_prs', 'id_ope', 'poids', 'sens_operation', 'nature_virement', 'num_cnt_com_emt', 'gamme_emt',
+            'sous_gamme_emt', 'nmlibemt', 'cdtypemt', 'cdibaemt', 'cdbicemt', 'num_cnt_com_des', 'gamme_des', 'sous_gamme_des',
+            'nmlibdes', 'cdtypdes', 'cdibades', 'cdbicdes', 'intra_inter', 'canal_acquisition_operation', 'canal', 'montant',
+            'date_execution', 'annee_mois_part'
+           )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# virements_inst_vf.unpersist()
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Write recipe outputs
+Hub_inst_emis = dataiku.Dataset("Hub_inst_emis")
+dkuspark.write_with_schema(Hub_inst_emis, Hub_inst_emis_df)
+
+Hub_inst_recus = dataiku.Dataset("Hub_inst_recus")
+dkuspark.write_with_schema(Hub_inst_recus, Hub_inst_recus_df)
+
+recipe3: virements classiques
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+import unicodedata
+import dataiku
+from pyspark.sql.types import *
+from dataiku import spark as dkuspark
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql import SparkSession, HiveContext
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+import random
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
+from pyspark.sql.functions import expr
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+sparkSession = (SparkSession
+                .builder.appName('CAC_hub_sct_download')
+                .master('yarn-client')
+                .config("spark.driver.maxResultSize", '10g')
+                .config('spark.driver.memory', '10g')
+                .config('spark.executor.memory', '2g')
+                .config('spark.executor.instances', 12)
+                .config('spark.sql.autoBroadcastJoinThreshold',-1)
+                .enableHiveSupport()
+                .getOrCreate()
+               )
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#PROJECT_KEY = dataiku.default_project_key() # Nom du projet dans lequel on se trouve
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# Tables sources et Dates à laquelle on veut réaliser les études des clients
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#var = dataiku.api_client().get_project(PROJECT_KEY).get_variables()
+#borne_inf = var['standard']['borne_inf'] 
+#borne_sup = var['standard']['borne_sup'] 
+#date_part = var['standard']['date_part_inf'] 
+borne_inf ="20260101"
+borne_sup = "20260630"
+date_part = 202601
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Read recipe inputs
+te_virements_safran = dataiku.Dataset("te_virements_safran")
+te_virements_safran = dkuspark.get_dataframe(sqlContext, te_virements_safran)
+
+perimetre_contrat = dataiku.Dataset("perimetre_contrat")
+perimetre_contrat = dkuspark.get_dataframe(sqlContext, perimetre_contrat)
+perimetre_contrat = perimetre_contrat.drop("annee_mois_part")
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# L'objet de ce notebook est d'obtenir tous les virements permanents et ponctuels sous format émis, reçus et rejetés.
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+table_virements_safran = (
+    te_virements_safran
+    .filter((F.col("code_type_operation").isin('SCT', 'VIR'))
+         & (F.col("date_execution_demandee_pour_operation") >= borne_inf) # date_execution_demandee_pour_operation à modifier pour être cohérent avec annee_mois_part
+         & (F.col("date_execution_demandee_pour_operation") <= borne_sup) # date_execution_demandee_pour_operation à modifier pour être cohérent avec annee_mois_part
+         & (F.col('date_part') >= date_part)
+         & (F.col('identifiant_operation').isNotNull())
+           )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+window = Window.partitionBy('identifiant_operation').orderBy(F.col('timestamp_gdo').desc())
+
+virements_safran = (
+    table_virements_safran
+    .withColumn('rank', F.rank().over(window))
+    .filter(F.col('rank') == 1)
+    .drop('rank')
+
+    .filter((F.col('type_de_personne_emetteur_operation')!='2') # uniquement PPH
+#              & (F.col('canal_acquisition_operation')!="FIA") Enlève tous les virements permanents ? Flux intra applications
+          )
+    .withColumn('statut', F.trim(F.col('code_statut_operation')))
+    .withColumn('montant', F.col('montant_operation') / 100)
+    .withColumn('num_cnt_com', (F.when((F.col("sens_operation") == 'E') &
+                                       (F.col('format_enregistrement_compte_emetteur') == "RIB"),
+                                       F.substring('numero_compte_emetteur', 11, 11))
+                                 .when((F.col("sens_operation") == 'E') &
+                                      (F.col('format_enregistrement_compte_emetteur') == 'IBAN'),
+                                      F.substring('numero_compte_emetteur', 15, 11))
+                                 .when((F.col("sens_operation") == 'R') &
+                                       (F.col('format_enregistrement_compte_beneficiaire') == "RIB"),
+                                       F.substring('numero_compte_beneficiaire', 11, 11))
+                                 .when((F.col("sens_operation") == 'R') &
+                                      (F.col('format_enregistrement_compte_beneficiaire') == 'IBAN'),
+                                      F.substring('numero_compte_beneficiaire', 15, 11))
+                               )
+               )
+    .withColumn("canal", F.when(F.col("canal_acquisition_operation").isin("BEL","APP","P2P","TPP"),"BEL")
+                          .otherwise(F.col("canal_acquisition_operation"))
+               )
+    .withColumn("annee_mois_part", F.substring('date_execution_demandee_pour_operation', 0, 6))
+    .withColumnRenamed("date_acquisition_operation", "date_acquisition")
+    .withColumnRenamed("date_execution_demandee_pour_operation", "date_execution")
+    .withColumn("type_personne_beneficiaire_operation", F.trim(F.col("type_personne_beneficiaire_operation")))
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+virements_safran_vf = (
+    virements_safran
+    .join(perimetre_contrat, on=['num_cnt_com'], how='inner')
+    .withColumn('poids', F.when(F.col("nbr_titulaire") >= 2 , 0.5).otherwise(1))
+    .withColumn('typ_virement', F.when(F.col("identifiant_operation").startswith("0226"), 'Permanent') # virement régulier
+                                 .otherwise('Ponctuel')
+               )
+    .select('id_prs', 'num_cnt_com','gamme', 'sous_gamme', 'identifiant_operation', 'sens_operation',
+            'typ_virement', 'poids', 'nom_emetteur','format_enregistrement_compte_emetteur', 'numero_compte_emetteur', 'bic_etablissement_emetteur',
+            'nom_du_beneficiaire', 'format_enregistrement_compte_beneficiaire', 'numero_compte_beneficiaire', 'bic_etablissement_beneficiaire',
+            'canal_acquisition_operation', 'canal', 'montant', 'date_acquisition', 'date_execution', 'annee_mois_part'
+           )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# virements_safran_vf.persist()
+# virements_safran_vf.count()
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#La Banque Postale a deux codes banques possibles. On précise que l'IBAN doit commencer par FR
+#car sinon certains virements sont identifiés 'intra' à tort (N26 en Allemagne)
+#Pour les opérations par RIB, il n'y a pas de code pays. Donc on estime que ces opérations
+#sont uniquement réalisés en France donc les codes banques sont bien ceux de La Banque Postale
+
+est_intra_recus_iban = (((F.substring(F.col("numero_compte_emetteur"), 5, 5) == "20041") |
+                         (F.substring(F.col("numero_compte_emetteur"), 5, 5) == "10011")) &
+                         (F.col('numero_compte_emetteur').startswith("FR")) &
+                         (F.col('format_enregistrement_compte_emetteur') == "IBAN"))
+
+est_intra_recus_rib =  (((F.substring(F.col("numero_compte_emetteur"), 1, 5) == "20041") |
+                         (F.substring(F.col("numero_compte_emetteur"), 1, 5) == "10011")) &
+                         (F.col('format_enregistrement_compte_emetteur') == "RIB"))
+
+est_intra_recus = (est_intra_recus_iban | est_intra_recus_rib)
+
+est_intra_emis_iban = (((F.substring(F.col("numero_compte_beneficiaire"), 5, 5) == "20041") |
+                         (F.substring(F.col("numero_compte_beneficiaire"), 5, 5) == "10011")) &
+                         (F.col('numero_compte_beneficiaire').startswith("FR")) &
+                         (F.col('format_enregistrement_compte_beneficiaire') == "IBAN"))
+
+est_intra_emis_rib =  (((F.substring(F.col("numero_compte_beneficiaire"), 1, 5) == "20041") |
+                         (F.substring(F.col("numero_compte_beneficiaire"), 1, 5) == "10011")) &
+                         (F.col('format_enregistrement_compte_beneficiaire') == "RIB"))
+
+est_intra_emis = (est_intra_emis_iban | est_intra_emis_rib)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+perimetre_contrat_gamme = (
+    perimetre_contrat
+    .select('num_cnt_com', 'gamme', 'sous_gamme')
+    .distinct()
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Virements émis
+virements_sct_emis = (
+    virements_safran_vf
+    .filter(((F.col('statut')=="EXE")) & (F.col("sens_operation")=='E'))  # Virements exécutés et émis
+    .withColumn('intra_inter', F.when(est_intra_emis, 'intra')
+                                .otherwise('inter'))
+    .withColumnRenamed('num_cnt_com', 'num_cnt_com_emt')
+    .withColumnRenamed('gamme', 'gamme_emt')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_emt')
+    .withColumn('num_cnt_com_des', F.when(est_intra_emis &
+                                           (F.col('format_enregistrement_compte_beneficiaire') == "RIB"),
+                                            F.substring('numero_compte_beneficiaire', 11,11))
+                                     .when(est_intra_emis &
+                                           (F.col('format_enregistrement_compte_beneficiaire') == 'IBAN'),
+                                            F.substring('numero_compte_beneficiaire', 15,11))
+                                     .otherwise(None))
+    .join(perimetre_contrat_gamme, F.col('num_cnt_com_des') == perimetre_contrat_gamme['num_cnt_com'], how='left')
+    .withColumnRenamed('gamme', 'gamme_des')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_des')
+    .withColumn('nature_virement', F.when(((F.col('sous_gamme_emt') == "CCP") &
+                                      ((F.col('gamme_des') == 'EPA_ORD') | (F.col('gamme_des') == 'EPA_LOG'))),
+                                      'CCP_to_EPA')
+                                .when((((F.col('gamme_emt') == 'EPA_ORD') | (F.col('gamme_emt') == 'EPA_LOG')) &
+                                        (F.col('sous_gamme_des') == "CCP")),
+                                      'EPA_to_CCP')
+                                .when(((F.col('sous_gamme_emt') == "CCP") & (F.col('sous_gamme_des') == "CCP")),
+                                      'CCP_to_CCP')
+                                .when((((F.col('gamme_emt') == "EPA_ORD") | (F.col('gamme_emt') == "EPA_LOG")) &
+                                      ((F.col('gamme_des') == "EPA_ORD") | (F.col('gamme_des') == "EPA_LOG"))),
+                                      'EPA_to_EPA')
+                                .when(((F.col('intra_inter') == "intra") & (F.col('gamme_des').isNull())),
+                                      'Contrat_clos_et_autre'))
+                                # Certains contrats n'ont pas de gamme, la plupart du temps c'est que ce sont des contrats clos
+
+    .select('id_prs', 'identifiant_operation',  'poids', 'sens_operation', 'typ_virement', 'nature_virement',
+            'num_cnt_com_emt', 'gamme_emt', 'sous_gamme_emt', 'nom_emetteur','format_enregistrement_compte_emetteur', 'bic_etablissement_emetteur',
+            'numero_compte_emetteur', 'nom_du_beneficiaire', 'format_enregistrement_compte_beneficiaire', 'bic_etablissement_beneficiaire',
+            'numero_compte_beneficiaire', 'num_cnt_com_des', 'gamme_des', 'sous_gamme_des', 'intra_inter',
+            'canal_acquisition_operation', 'canal', 'montant', 'date_acquisition', 'date_execution', 'annee_mois_part'
+           )
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Virements reçus
+virements_sct_recus = (
+    virements_safran_vf
+    .filter(((F.col('statut')=="EXE")) & (F.col("sens_operation")=='R'))  # Virements exécutés et reçus
+    .filter(~est_intra_recus) #On enlève les intra pour éviter la redondance avec les virements émis
+    .withColumn('intra_inter', F.when(est_intra_recus, 'intra')
+                                .otherwise('inter'))
+    .withColumnRenamed('num_cnt_com', 'num_cnt_com_des')
+    .withColumnRenamed('gamme', 'gamme_des')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_des')
+    .withColumn('num_cnt_com_emt', F.when(est_intra_recus &
+                                           (F.col('format_enregistrement_compte_emetteur') == "RIB"),
+                                            F.substring('numero_compte_emetteur', 11,11))
+                                     .when(est_intra_recus &
+                                           (F.col('format_enregistrement_compte_emetteur') == 'IBAN'),
+                                            F.substring('numero_compte_emetteur', 15,11))
+                                     .otherwise(None))
+    .join(perimetre_contrat_gamme, F.col('num_cnt_com_emt') == perimetre_contrat_gamme['num_cnt_com'], how='left')
+    .withColumnRenamed('gamme', 'gamme_emt')
+    .withColumnRenamed('sous_gamme', 'sous_gamme_emt')
+    .withColumn('nature_virement', F.when(((F.col('sous_gamme_emt') == "CCP") &
+                                      ((F.col('gamme_des') == 'EPA_ORD') | (F.col('gamme_des') == 'EPA_LOG'))),
+                                      'CCP_to_EPA')
+                                    .when((((F.col('gamme_emt') == 'EPA_ORD') | (F.col('gamme_emt') == 'EPA_LOG')) &
+                                        (F.col('sous_gamme_des') == "CCP")),
+                                      'EPA_to_CCP')
+                                    .when(((F.col('sous_gamme_emt') == "CCP") & (F.col('sous_gamme_des') == "CCP")),
+                                      'CCP_to_CCP')
+                                    .when((((F.col('gamme_emt') == "EPA_ORD") | (F.col('gamme_emt') == "EPA_LOG")) &
+                                      ((F.col('gamme_des') == "EPA_ORD") | (F.col('gamme_des') == "EPA_LOG"))),
+                                      'EPA_to_EPA')
+                                    .when(((F.col('intra_inter') == "intra") & (F.col('gamme_emt').isNull())),
+                                      'Contrat_clos_et_autre'))
+                                    # Certains contrats n'ont pas de gamme, la plupart du temps c'est que ce sont des contrats clos
+
+    .select('id_prs', 'identifiant_operation',  'poids', 'sens_operation', 'typ_virement', 'nature_virement',
+            'num_cnt_com_emt', 'gamme_emt', 'sous_gamme_emt', 'nom_emetteur','format_enregistrement_compte_emetteur', 'bic_etablissement_emetteur',
+            'numero_compte_emetteur', 'nom_du_beneficiaire', 'format_enregistrement_compte_beneficiaire', 'bic_etablissement_beneficiaire',
+            'numero_compte_beneficiaire', 'num_cnt_com_des', 'gamme_des', 'sous_gamme_des', 'intra_inter',
+            'canal_acquisition_operation', 'canal', 'montant', 'date_acquisition', 'date_execution', 'annee_mois_part')
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# virements_safran_vf.unpersist()
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Write recipe outputs
+Hub_sct_emis = dataiku.Dataset("Hub_sct_emis")
+dkuspark.write_with_schema(Hub_sct_emis, virements_sct_emis)
+
+Hub_sct_recus = dataiku.Dataset("Hub_sct_recus")
+dkuspark.write_with_schema(Hub_sct_recus, virements_sct_recus)
