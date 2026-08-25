@@ -1,0 +1,56 @@
+# -*- coding: utf-8 -*-
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SparkSession, HiveContext
+from pyspark.sql.functions import *
+import pandas as pd
+from pyspark.sql.window import Window
+from pyspark.sql.types import StringType
+from pyspark.sql.functions import udf, trim, lit, col
+import datetime
+
+sparkSession = (SparkSession
+                .builder
+                .master('yarn-client')
+                .config("spark.driver.maxResultSize", '4g')
+                .config('spark.driver.memory', '4g')
+                .config('spark.executor.memory', '4g')
+                .config('spark.executor.instances', 20)
+                .config('spark.sql.autoBroadcastJoinThreshold',-1)
+                .config('spark.sql.parquet.writeLegacyFormat', True)
+                .enableHiveSupport()
+                .getOrCreate())
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# Read recipe inputs
+clients_inactifs_eckert = dataiku.Dataset("clients_inactifs_eckert")
+clients_inactifs_eckert_df = dkuspark.get_dataframe(sqlContext, clients_inactifs_eckert)
+lbp_al42_repr_pph_active_q = dataiku.Dataset("lbp_al42_repr_pph_active_q")
+lbp_al42_repr_pph_active_q_df = dkuspark.get_dataframe(sqlContext, lbp_al42_repr_pph_active_q)
+tr_typ_lien_prs = dataiku.Dataset("tr_typ_lien_prs")
+tr_typ_lien_prs_df = dkuspark.get_dataframe(sqlContext, tr_typ_lien_prs)
+# Compute recipe outputs
+# TODO: Write here your actual code that computes the outputs as SparkSQL dataframes
+#Acendants AD
+lbp_al42_repr_pph_active_q_df = lbp_al42_repr_pph_active_q_df.filter((col('type_lien_partenaires'
+        ).isin(['A', 'D', 'C'])) & (col('date_de_creation') <= '2026-04-30')).select(
+    col('identifiant_partenaire'),
+    col('to_utc_timestamp(CAST(date_de_creation AS TIMESTAMP), Europe/Paris)'
+        ).alias('date_de_creation'),
+    col('identifiant_partenaire_lie'),
+    col('type_de_partenaire'),
+    col('type_de_partenaire_lie'),
+    col('type_lien_partenaires'),
+    )
+
+
+Liens_Eckert_df = clients_inactifs_eckert_df.join(lbp_al42_repr_pph_active_q_df, clients_inactifs_eckert_df.ID_PRS==lbp_al42_repr_pph_active_q_df.identifiant_partenaire, how='left') # Compute a SparkSQL dataframe to write into Liens_Eckert
+Liens_Eckert_df = Liens_Eckert_df.join(clients_inactifs_eckert_df, clients_inactifs_eckert_df.ID_PRS==Liens_Eckert_df.identifiant_partenaire_lie, how='left')
+# Write recipe outputs
+Liens_Eckert = dataiku.Dataset("Liens_Eckert")
+dkuspark.write_with_schema(Liens_Eckert, Liens_Eckert_df)
