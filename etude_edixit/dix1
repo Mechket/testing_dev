@@ -1,0 +1,667 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# ============================================================
+# 1. PARAMETRES A MODIFIER
+# ============================================================
+
+# Fichiers sources
+#FICHIER_BENEFICIAIRES = "beneficiaires.xlsx"
+#FICHIER_NON_BENEFICIAIRES = "non_beneficiaires.xlsx"
+
+# Nom de la colonne contenant le mois d'entretien
+COLONNE_MOIS_ENTRETIEN = "entretien_mois"
+
+# ============================================================
+# LISTE DES METRIQUES A REPRENDRE
+# ============================================================
+#
+# NE PAS mettre les suffixes temporels ici.
+#
+# Exemple :
+# "encours" donnera automatiquement :
+# encours_M
+# encours_M1
+# encours_M3
+# encours_M6
+#
+# "nb_produits" donnera :
+# nb_produits_M
+# nb_produits_M1
+# nb_produits_M3
+# nb_produits_M6
+#
+
+METRICS = [
+    'fcm_median', 'mnt_crd_credit_immo', 'mnt_crd_credit_perso',
+    'mnt_epa_disp', 'mnt_epa_non_disp',
+    'srf_ass_vie', 'srf_ccp_moyen', 'srf_epa_log', 'srf_epa_ord',
+    'srf_fnc_inst', 'srf_val_mob', 'mnt_encours_cel', 'mnt_encours_ldd', 'mnt_encours_lep',
+    'mnt_encours_livret_a', 'mnt_encours_livret_b', 'mnt_encours_livret_jeune',
+    'mnt_encours_pel'
+]
+
+# Suffixes présents dans les datasets
+HORIZONS = {
+    "M": "_M",
+    "M+1": "_M1",
+    "M+3": "_M3",
+    "M+6": "_M6",
+}
+
+# Si tu veux également M-12, M-6, M-3, M-1, il suffit de
+# les ajouter ici si les colonnes existent dans tes fichiers.
+#
+# Exemple :
+#
+# HORIZONS = {
+# "M-12": "_M12",
+# "M-6": "_M6_AVANT",
+# "M-3": "_M3_AVANT",
+# "M-1": "_M1_AVANT",
+# "M": "_M",
+# "M+1": "_M1",
+# "M+3": "_M3",
+# "M+6": "_M6",
+# }
+
+
+# Nom du fichier Excel de sortie
+FICHIER_SORTIE = "analyse_beneficiaires_vs_non_beneficiaires_vf2.xlsx"
+
+
+# ============================================================
+# 2. LECTURE DES DONNEES
+# ============================================================
+
+print("Lecture des fichiers...")
+
+df_benef = data_benef
+df_non_benef = data_non_benef
+
+print(f"Bénéficiaires : {len(df_benef):,} lignes")
+print(f"Non-bénéficiaires : {len(df_non_benef):,} lignes")
+
+
+# ============================================================
+# 3. VERIFICATION DES COLONNES
+# ============================================================
+
+def verifier_colonnes(df, nom_dataset):
+    """
+    Vérifie que la colonne mois d'entretien existe
+    et affiche les colonnes manquantes.
+    """
+
+    if COLONNE_MOIS_ENTRETIEN not in df.columns:
+        raise ValueError(
+            f"La colonne '{COLONNE_MOIS_ENTRETIEN}' "
+            f"n'existe pas dans le dataset {nom_dataset}."
+        )
+
+    colonnes_manquantes = []
+
+    for metric in METRICS:
+        for horizon, suffixe in HORIZONS.items():
+
+            colonne = f"{metric}{suffixe}"
+
+            if colonne not in df.columns:
+                colonnes_manquantes.append(colonne)
+
+    if colonnes_manquantes:
+        print(
+            f"\nATTENTION - colonnes manquantes dans {nom_dataset} :"
+        )
+
+        for colonne in colonnes_manquantes:
+            print(f" - {colonne}")
+
+    return colonnes_manquantes
+
+
+manquantes_benef = verifier_colonnes(
+    df_benef,
+    "bénéficiaires"
+)
+
+manquantes_non_benef = verifier_colonnes(
+    df_non_benef,
+    "non-bénéficiaires"
+)
+
+
+# ============================================================
+# 4. PREPARATION DES MOIS D'ENTRETIEN
+# ============================================================
+
+def preparer_mois(df):
+    """
+    Convertit le mois d'entretien en datetime
+    lorsque cela est possible.
+    """
+
+    df = df.copy()
+
+    df[COLONNE_MOIS_ENTRETIEN] = pd.to_datetime(
+        df[COLONNE_MOIS_ENTRETIEN],
+        errors="coerce"
+    )
+    
+    return df
+
+
+#df_benef = preparer_mois(df_benef)
+#df_non_benef = preparer_mois(df_non_benef)
+
+
+# ============================================================
+# 5. LISTE DES MOIS D'ENTRETIEN
+# ============================================================
+
+mois_benef = set(
+    df_benef[COLONNE_MOIS_ENTRETIEN]
+    .dropna()
+    .unique()
+)
+
+mois_non_benef = set(
+    df_non_benef[COLONNE_MOIS_ENTRETIEN]
+    .dropna()
+    .unique()
+)
+
+# On prend l'ensemble des mois présents dans les deux datasets
+MOIS_ENTRETIEN = sorted(
+    mois_benef.union(mois_non_benef)
+)
+
+print("\nMois d'entretien détectés :")
+
+for mois in MOIS_ENTRETIEN:
+    print(mois)
+
+
+# ============================================================
+# 6. FONCTION DE CALCUL DES STATISTIQUES
+# ============================================================
+
+def calculer_statistiques(df, colonne, mois):
+    """
+    Calcule :
+    - nombre d'observations
+    - moyenne
+    - médiane
+
+    pour un mois d'entretien donné.
+    """
+
+    if colonne not in df.columns:
+        return {
+            "nombre": np.nan,
+            "moyenne": np.nan,
+            "mediane": np.nan
+        }
+
+    subset = df[
+        df[COLONNE_MOIS_ENTRETIEN] == mois
+    ][colonne]
+
+    # Conversion numérique
+    subset = pd.to_numeric(
+        subset,
+        errors="coerce"
+    ).dropna()
+
+    if len(subset) == 0:
+        return {
+            "nombre": 0,
+            "moyenne": np.nan,
+            "mediane": np.nan
+        }
+
+    return {
+        "nombre": len(subset),
+        "moyenne": subset.mean(),
+        "mediane": subset.median()
+    }
+
+
+# ============================================================
+# 7. CREATION DU FICHIER EXCEL
+# ============================================================
+
+wb = Workbook()
+
+# Supprimer la feuille créée automatiquement
+ws_initial = wb.active
+wb.remove(ws_initial)
+
+
+# ============================================================
+# 8. STYLES
+# ============================================================
+
+BLEU_FONCE = "17365D"
+BLEU = "5B9BD5"
+BLEU_CLAIR = "D9EAF7"
+JAUNE = "FFD966"
+BLANC = "FFFFFF"
+GRIS = "D9E1F2"
+
+thin = Side(
+    style="thin",
+    color="FFFFFF"
+)
+
+border = Border(
+    left=thin,
+    right=thin,
+    top=thin,
+    bottom=thin
+)
+
+
+# ============================================================
+# 9. NOM DE L'ONGLET
+# ============================================================
+
+def nom_onglet(metric):
+    """
+    Excel limite les noms d'onglet à 31 caractères.
+    """
+
+    nom = metric.replace("_", " ")
+
+    return nom[:31]
+
+
+# ============================================================
+# 10. CREATION D'UN ONGLET PAR METRIQUE
+# ============================================================
+
+for metric in METRICS:
+
+    print(f"\nCréation de l'onglet : {metric}")
+
+    ws = wb.create_sheet(
+        title=nom_onglet(metric)
+    )
+
+    # --------------------------------------------------------
+    # TITRE
+    # --------------------------------------------------------
+
+    ws.merge_cells(
+        start_row=1,
+        start_column=1,
+        end_row=1,
+        end_column=len(HORIZONS) + 1
+    )
+
+    cell = ws.cell(
+        row=1,
+        column=1
+    )
+
+    cell.value = (
+        f"Évolution de {metric} "
+        f"chez les bénéficiaires et non-bénéficiaires"
+    )
+
+    cell.font = Font(
+        bold=True,
+        size=14
+    )
+
+    cell.fill = PatternFill(
+        "solid",
+        fgColor=JAUNE
+    )
+
+    cell.alignment = Alignment(
+        horizontal="left",
+        vertical="center"
+    )
+
+    ws.row_dimensions[1].height = 25
+
+    # Sous-titre
+    ws.merge_cells(
+        start_row=2,
+        start_column=1,
+        end_row=2,
+        end_column=len(HORIZONS) + 1
+    )
+
+    ws.cell(
+        row=2,
+        column=1
+    ).value = (
+        "Comparaison bénéficiaires / non-bénéficiaires "
+        "autour du mois d'entretien"
+    )
+
+    ws.cell(
+        row=2,
+        column=1
+    ).font = Font(
+        italic=True,
+        color="666666"
+    )
+
+
+    # --------------------------------------------------------
+    # UN TABLEAU PAR MOIS D'ENTRETIEN
+    # --------------------------------------------------------
+
+    ligne = 4
+
+    for mois in MOIS_ENTRETIEN:
+
+        #mois_label = mois.strftime("%B %Y").capitalize()
+        
+
+        # ----------------------------------------------------
+        # TITRE DU TABLEAU
+        # ----------------------------------------------------
+        mois_label = mois
+        ws.merge_cells(
+            start_row=ligne,
+            start_column=1,
+            end_row=ligne,
+            end_column=len(HORIZONS) + 1
+        )
+
+        titre = ws.cell(
+            row=ligne,
+            column=1
+        )
+
+        titre.value = (
+            f"Mois d'entretien : {mois_label}"
+        )
+
+        titre.font = Font(
+            bold=True,
+            color=BLANC
+        )
+
+        titre.fill = PatternFill(
+            "solid",
+            fgColor=BLEU_FONCE
+        )
+
+        titre.alignment = Alignment(
+            horizontal="left"
+        )
+
+        ligne += 1
+
+        # ----------------------------------------------------
+        # EN-TETE DES PERIODES
+        # ----------------------------------------------------
+
+        ws.cell(
+            row=ligne,
+            column=1
+        ).value = ""
+
+        for col, horizon in enumerate(
+            HORIZONS.keys(),
+            start=2
+        ):
+
+            cell = ws.cell(
+                row=ligne,
+                column=col
+            )
+
+            cell.value = horizon
+            cell.font = Font(
+                bold=True,
+                color=BLANC
+            )
+
+            cell.fill = PatternFill(
+                "solid",
+                fgColor=BLEU_FONCE
+            )
+
+            cell.alignment = Alignment(
+                horizontal="center"
+            )
+
+            cell.border = border
+
+        # Mise en évidence de M
+        col_m = list(HORIZONS.keys()).index("M") + 2
+
+        ws.cell(
+            row=ligne,
+            column=col_m
+        ).fill = PatternFill(
+            "solid",
+            fgColor=BLEU
+        )
+
+        ligne += 1
+
+
+        # ----------------------------------------------------
+        # CALCULS
+        # ----------------------------------------------------
+
+        lignes_stats = {
+            "Nombre bénéficiaires": {},
+            "Nombre non-bénéficiaires": {},
+            "Moyenne bénéficiaires": {},
+            "Moyenne non-bénéficiaires": {},
+            "Écart moyenne": {},
+            "Médiane bénéficiaires": {},
+            "Médiane non-bénéficiaires": {},
+            "Écart médiane": {}
+        }
+
+        for horizon, suffixe in HORIZONS.items():
+
+            colonne_metric = f"{metric}{suffixe}"
+
+            stats_benef = calculer_statistiques(
+                df_benef,
+                colonne_metric,
+                mois
+            )
+
+            stats_non_benef = calculer_statistiques(
+                df_non_benef,
+                colonne_metric,
+                mois
+            )
+
+            # Nombre
+            lignes_stats[
+                "Nombre bénéficiaires"
+            ][horizon] = stats_benef["nombre"]
+
+            lignes_stats[
+                "Nombre non-bénéficiaires"
+            ][horizon] = stats_non_benef["nombre"]
+
+            # Moyenne
+            lignes_stats[
+                "Moyenne bénéficiaires"
+            ][horizon] = stats_benef["moyenne"]
+
+            lignes_stats[
+                "Moyenne non-bénéficiaires"
+            ][horizon] = stats_non_benef["moyenne"]
+
+            # Ecart moyenne
+            if (
+                pd.notna(stats_benef["moyenne"])
+                and
+                pd.notna(stats_non_benef["moyenne"])
+            ):
+                lignes_stats[
+                    "Écart moyenne"
+                ][horizon] = (
+                    stats_benef["moyenne"]
+                    -
+                    stats_non_benef["moyenne"]
+                )
+            else:
+                lignes_stats[
+                    "Écart moyenne"
+                ][horizon] = np.nan
+
+            # Médiane
+            lignes_stats[
+                "Médiane bénéficiaires"
+            ][horizon] = stats_benef["mediane"]
+
+            lignes_stats[
+                "Médiane non-bénéficiaires"
+            ][horizon] = stats_non_benef["mediane"]
+
+            # Ecart médiane
+            if (
+                pd.notna(stats_benef["mediane"])
+                and
+                pd.notna(stats_non_benef["mediane"])
+            ):
+                lignes_stats[
+                    "Écart médiane"
+                ][horizon] = (
+                    stats_benef["mediane"]
+                    -
+                    stats_non_benef["mediane"]
+                )
+            else:
+                lignes_stats[
+                    "Écart médiane"
+                ][horizon] = np.nan
+
+
+        # ----------------------------------------------------
+        # ECRITURE DES RESULTATS
+        # ----------------------------------------------------
+
+        ordre_lignes = [
+            "Nombre bénéficiaires",
+            "Nombre non-bénéficiaires",
+            "Moyenne bénéficiaires",
+            "Moyenne non-bénéficiaires",
+            "Écart moyenne",
+            "Médiane bénéficiaires",
+            "Médiane non-bénéficiaires",
+            "Écart médiane"
+        ]
+
+        for nom_ligne in ordre_lignes:
+
+            ws.cell(
+                row=ligne,
+                column=1
+            ).value = nom_ligne
+
+            # Style des libellés
+            ws.cell(
+                row=ligne,
+                column=1
+            ).font = Font(
+                bold=(
+                    "Écart" in nom_ligne
+                    or
+                    "Nombre" in nom_ligne
+                )
+            )
+
+            for col, horizon in enumerate(
+                HORIZONS.keys(),
+                start=2
+            ):
+
+                cell = ws.cell(
+                    row=ligne,
+                    column=col
+                )
+
+                cell.value = lignes_stats[
+                    nom_ligne
+                ][horizon]
+
+                cell.alignment = Alignment(
+                    horizontal="center"
+                )
+
+                cell.border = border
+
+                # Format nombre
+                if "Nombre" in nom_ligne:
+                    cell.number_format = '#,##0'
+
+                else:
+                    cell.number_format = '#,##0.00'
+
+                # Mise en évidence des écarts
+                if "Écart" in nom_ligne:
+                    cell.font = Font(
+                        bold=True
+                    )
+
+                    cell.fill = PatternFill(
+                        "solid",
+                        fgColor=BLEU_CLAIR
+                    )
+
+            ligne += 1
+
+
+        # ----------------------------------------------------
+        # ESPACE AVANT LE TABLEAU SUIVANT
+        # ----------------------------------------------------
+
+        ligne += 2
+
+
+    # ========================================================
+    # LARGEUR DES COLONNES
+    # ========================================================
+
+    ws.column_dimensions["A"].width = 28
+
+    for col in range(
+        2,
+        len(HORIZONS) + 2
+    ):
+
+        ws.column_dimensions[
+            get_column_letter(col)
+        ].width = 14
+
+
+    # ========================================================
+    # FIGER LES VOLETS
+    # ========================================================
+
+    ws.freeze_panes = "B5"
+
+
+# ============================================================
+# 11. SAUVEGARDE
+# ============================================================
+
+wb.save(FICHIER_SORTIE)
+
+print("\n" + "=" * 60)
+print("TERMINÉ")
+print("=" * 60)
+print(
+    f"Fichier créé : {Path(FICHIER_SORTIE).resolve()}"
+)
