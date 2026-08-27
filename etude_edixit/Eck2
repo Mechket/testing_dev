@@ -1,0 +1,125 @@
+# -*- coding: utf-8 -*-
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession, HiveContext
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+import pandas as pd
+import datetime
+
+sparkSession = (SparkSession
+                .builder
+                .master('yarn-client')
+                .config("spark.driver.maxResultSize", '4g')
+                .config('spark.driver.memory', '4g')
+                .config('spark.executor.memory', '4g')
+                .config('spark.executor.instances', 20)
+                .config('spark.sql.autoBroadcastJoinThreshold', -1)
+                .config('spark.sql.parquet.writeLegacyFormat', True)
+                .enableHiveSupport()
+                .getOrCreate())
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# ---------------------------------------------------------------
+# Paramètres
+# ---------------------------------------------------------------
+ANNEE_MOIS_PART = 202604
+DATE_MAX_LIEN = '2026-04-30'
+TYPES_LIEN = ['A', 'D', 'C']
+COL_DATE_CREA = 'to_utc_timestamp(CAST(date_de_creation AS TIMESTAMP), Europe/Paris)'
+
+# ---------------------------------------------------------------
+# Read recipe inputs
+# ---------------------------------------------------------------
+clients_inactifs_eckert = dataiku.Dataset("clients_inactifs_eckert")
+clients_inactifs_eckert_df = dkuspark.get_dataframe(sqlContext, clients_inactifs_eckert)
+
+lbp_al42_repr_pph_active_q = dataiku.Dataset("lbp_al42_repr_pph_active_q")
+lbp_al42_repr_pph_active_q_df = dkuspark.get_dataframe(sqlContext, lbp_al42_repr_pph_active_q)
+
+tr_typ_lien_prs = dataiku.Dataset("tr_typ_lien_prs")
+tr_typ_lien_prs_df = dkuspark.get_dataframe(sqlContext, tr_typ_lien_prs)
+
+bloc_seg_cur_ext = dataiku.Dataset("bloc_seg_cur_ext")
+bloc_seg_cur_ext_df = dkuspark.get_dataframe(sqlContext, bloc_seg_cur_ext)
+
+# Relectures indépendantes : casse la lignée Spark et évite les
+# AnalysisException d'ambiguïté sur les self-joins
+eckert_lie_df = dkuspark.get_dataframe(sqlContext, dataiku.Dataset("clients_inactifs_eckert"))
+bloc_seg_lie_df = dkuspark.get_dataframe(sqlContext, dataiku.Dataset("bloc_seg_cur_ext"))
+
+# ---------------------------------------------------------------
+# Préparation des référentiels
+# ---------------------------------------------------------------
+liens_df = (lbp_al42_repr_pph_active_q_df
+            .filter(col('type_lien_partenaires').isin(TYPES_LIEN)
+                    & (col('date_de_creation') <= DATE_MAX_LIEN))
+            .select(col('identifiant_partenaire'),
+                    col(COL_DATE_CREA).alias('date_de_creation'),
+                    col('identifiant_partenaire_lie'),
+                    col('type_de_partenaire'),
+                    col('type_de_partenaire_lie'),
+                    col('type_lien_partenaires')))
+
+# Segment du client Eckert
+seg_eckert_df = (bloc_seg_cur_ext_df
+                 .filter((col("annee_mois_part") == ANNEE_MOIS_PART)
+                         & (col("cd_seg_com_engag_stb") > 0))
+                 .select(col("id_prs").alias("id_prs_seg"),
+                         col("cd_seg_com_marche_stb").alias("cd_seg_com_marche_stb_ECKERT")))
+
+# Segment du client lié (relecture séparée, colonnes suffixées dès le select)
+seg_lie_df = (bloc_seg_lie_df
+              .filter((col("annee_mois_part") == ANNEE_MOIS_PART)
+                      & (col("cd_seg_com_engag_stb") > 0))
+              .select(col("id_prs").alias("id_prs_lie_seg"),
+                      col("cd_seg_com_marche_stb").alias("cd_seg_com_marche_stb_lie_seg")))
+
+# Attributs Eckert du client lié : toutes les colonnes suffixées _LIE
+eckert_lie_df = eckert_lie_df.select([col(c).alias(c + "_LIE") for c in eckert_lie_df.columns])
+
+# ---------------------------------------------------------------
+# Construction de Liens_Eckert
+# ---------------------------------------------------------------
+# On ne garde que les clients inactifs vivants présents dans les socles à fin avril
+base_df = (clients_inactifs_eckert_df
+           .join(seg_eckert_df,
+                 clients_inactifs_eckert_df.ID_PRS == seg_eckert_df.id_prs_seg,
+                 how='inner')
+           .drop("id_prs_seg"))
+
+Liens_Eckert_df = base_df.join(liens_df,
+                               base_df.ID_PRS == liens_df.identifiant_partenaire,
+                               how='left')
+
+Liens_Eckert_df = (Liens_Eckert_df
+                   .join(seg_lie_df,
+                         Liens_Eckert_df.identifiant_partenaire_lie == seg_lie_df.id_prs_lie_seg,
+                         how='left')
+                   .drop("id_prs_lie_seg"))
+
+Liens_Eckert_df = (Liens_Eckert_df
+                   .join(eckert_lie_df,
+                         Liens_Eckert_df.identifiant_partenaire_lie == eckert_lie_df.ID_PRS_LIE,
+                         how='left'))
+
+# TODO : adapter les noms de colonnes au schéma réel de tr_typ_lien_prs
+# tr_typ_lien_prs_df = tr_typ_lien_prs_df.select(
+#     col("cd_typ_lien_prs").alias("cd_typ_lien"),
+#     col("lb_typ_lien_prs").alias("libelle_type_lien"))
+# Liens_Eckert_df = (Liens_Eckert_df
+#                    .join(tr_typ_lien_prs_df,
+#                          Liens_Eckert_df.type_lien_partenaires == tr_typ_lien_prs_df.cd_typ_lien,
+#                          how='left')
+#                    .drop("cd_typ_lien"))
+
+# ---------------------------------------------------------------
+# Write recipe outputs
+# ---------------------------------------------------------------
+Liens_Eckert = dataiku.Dataset("Liens_Eckert")
+dkuspark.write_with_schema(Liens_Eckert, Liens_Eckert_df)
