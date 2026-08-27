@@ -1,0 +1,22 @@
+#sujet de comparaison de profil qui ont bénéficié de différents offres sur la FDC:
+#-	Offre conjoint (a commencé le 1er juin):
+#o	déjà client souscrivant une FDC via l’offre → comparé à la même cible, non-souscripteur de l’offre (population témoin)
+#o	prospect (nouveau client) conquis FDC via l’offre → comparé à la conquête classique sur la même période 
+ 
+#-	Offre conquête interne (a commencé le 1er juin) → comparé à la même cible, non-souscripteur de l’offre (population témoin)
+#-	Offre diplômé (a commencé le 7 juillet):
+#o	Enfant déjà client conquis avec l’offre → comparé à la même cible, non-souscripteur de l’offre (population témoin)
+#o	Enfant prospect conquis avec l’offre → comparé à la conquête classique 17-18 ans sur la même période
+
+#Notes: 
+#POUR INFO : Les offres promotionnelles sur la Formule de Compte sont stockées dans la table et commencent par TP.
+#Table TE_TFP_LIG_FRAIS/  CD_CND_PRM
+#La requête suivante dans le DWH SELECT * FROM LIG_FRAIS WHERE CD_CND_PRM LIKE '%TP%'
+#offre conjoint CD_CND_PRM = 'TPFCCONJ'
+#Code promo : AVANTAGE CONQUETE INTERNE
+
+# On va se positionner à fin juillet
+# Les nouveaux clients c'est à définir avec un bloc marketing bloc_seg qui a des données mensuelles (annee_mois_part de format '202607' par exemple), un nouveau client au mois de juin c'est quelqu'un qui n'a pas été dans les socles fin mai mais qui l'est en fin juin par exemple.
+# les déjà clients ne sont pas les nouveaux mais qui ont bénéficié 
+
+ 
