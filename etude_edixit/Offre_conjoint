@@ -1,0 +1,227 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Recette Dataiku / PySpark
+# Population BENEFICIAIRE de l'offre CONJOINT sur FDC (01/06/2026 -> 31/07/2026)
+#
+# A declarer dans la recette :
+#   Inputs  : TE_TFP_LIG_FRAIS, BLOC_CONTRAT, BLOC_SOCIO
+#   Output  : populations_beneficiaires_conjoint
+#
+# Regle retenue : est NOUVEAU CLIENT quiconque est absent du socle de fin mai
+# (dernier arrete avant le debut de l'offre) et apparait en juin OU en juillet.
+# Le mois d'entree est conserve pour distinguer les deux vagues.
+# =============================================================================
+
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SparkSession, functions as F, Window
+
+spark = SparkSession.builder.appName("population_conjoint").getOrCreate()
+
+# -----------------------------------------------------------------------------
+# 1. PARAMETRES  ( >>> A ADAPTER <<< )
+# -----------------------------------------------------------------------------
+DS_LIG_FRAIS    = "TE_TFP_LIG_FRAIS"
+DS_BLOC_CONTRAT = "BLOC_CONTRAT"   # annee_mois_part, id_prs, no_cnt_det
+DS_BLOC_SOCIO   = "BLOC_SOCIO"     # annee_mois_part, id_prs, age_pph
+
+COL_DATE_FRAIS = "dt_ope_lig_frais"
+COL_NUM_DET    = "no_cnt_det"
+COL_ID_PRS     = "id_prs"
+COL_AGE        = "age_pph"
+
+CD_PRM_CONJOINT = "TPFCCONJ"
+
+DT_DEB_OFFRE = "2026-06-01"
+DT_FIN_OBS   = "2026-07-31"
+
+MOIS_AVANT_REF = "202604"   # avril : distingue les deja-clients entres en mai
+MOIS_REF       = "202605"   # fin mai : dernier arrete AVANT le debut de l'offre
+MOIS_V1        = "202606"   # juin
+MOIS_V2        = "202607"   # juillet = arrete
+MOIS_SOCLES    = [MOIS_AVANT_REF, MOIS_REF, MOIS_V1, MOIS_V2]
+
+# Un no_cnt_det peut porter plusieurs id_prs (co-titulaires) : c'est le coeur du
+# sujet ici. True = on garde les deux titulaires de la FDC.
+KEEP_COTITULAIRES = True
+
+# -----------------------------------------------------------------------------
+# 2. LIGNES DE FRAIS PORTANT LE CODE PROMO
+# -----------------------------------------------------------------------------
+lig = (
+    dkuspark.get_dataframe(spark, dataiku.Dataset(DS_LIG_FRAIS))
+    .filter(F.upper(F.col("cd_cnd_prm")) == CD_PRM_CONJOINT)
+    .filter(
+        (F.col(COL_DATE_FRAIS) >= F.lit(DT_DEB_OFFRE))
+        & (F.col(COL_DATE_FRAIS) <= F.lit(DT_FIN_OBS))
+    )
+    .select(
+        F.col(COL_NUM_DET).alias("no_cnt_det"),
+        F.col(COL_DATE_FRAIS).alias("dt_ope"),
+    )
+)
+
+# Plusieurs lignes de frais par contrat : on garde la premiere operation
+w_cnt = Window.partitionBy("no_cnt_det").orderBy(F.col("dt_ope").asc())
+contrats_benef = (
+    lig.withColumn("rn", F.row_number().over(w_cnt))
+       .filter(F.col("rn") == 1)
+       .drop("rn")
+)
+
+print("contrats beneficiaires %s : %s" % (CD_PRM_CONJOINT, contrats_benef.count()))
+
+# -----------------------------------------------------------------------------
+# 3. PASSAGE no_cnt_det -> id_prs (bloc contrat mensuel)
+#    Derniere photo disponible du contrat, pour recuperer les DEUX titulaires
+#    apres l'ajout du conjoint.
+# -----------------------------------------------------------------------------
+bloc_cnt = (
+    dkuspark.get_dataframe(spark, dataiku.Dataset(DS_BLOC_CONTRAT))
+    .filter(F.col("annee_mois_part").isin(MOIS_SOCLES))
+    .select(
+        F.col(COL_NUM_DET).alias("no_cnt_det"),
+        F.col(COL_ID_PRS).alias("id_prs"),
+        F.col("annee_mois_part"),
+    )
+)
+
+w_det = Window.partitionBy("no_cnt_det")
+ref_det = (
+    bloc_cnt.withColumn("mois_max", F.max("annee_mois_part").over(w_det))
+            .filter(F.col("annee_mois_part") == F.col("mois_max"))
+            .dropDuplicates(["no_cnt_det", "id_prs"])
+            .select("no_cnt_det", "id_prs")
+)
+
+nb_multi = (
+    ref_det.groupBy("no_cnt_det").agg(F.countDistinct("id_prs").alias("nb_prs"))
+           .filter(F.col("nb_prs") > 1).count()
+)
+print("no_cnt_det avec plusieurs id_prs (co-titulaires) : %s" % nb_multi)
+
+if not KEEP_COTITULAIRES:
+    ref_det = ref_det.dropDuplicates(["no_cnt_det"])
+
+benef = contrats_benef.join(ref_det, on="no_cnt_det", how="inner")
+
+# Un client peut porter plusieurs contrats beneficiaires : on garde le premier
+w_prs = Window.partitionBy("id_prs").orderBy(F.col("dt_ope").asc())
+benef = (
+    benef.withColumn("rn", F.row_number().over(w_prs))
+         .filter(F.col("rn") == 1)
+         .drop("rn")
+         .withColumn("offre", F.lit("CONJOINT"))
+         .withColumn("mois_ope", F.date_format(F.col("dt_ope"), "yyyyMM"))
+)
+
+# -----------------------------------------------------------------------------
+# 4. PRESENCE MENSUELLE + AGE (bloc socio)
+# -----------------------------------------------------------------------------
+socio = (
+    dkuspark.get_dataframe(spark, dataiku.Dataset(DS_BLOC_SOCIO))
+    .filter(F.col("annee_mois_part").isin(MOIS_SOCLES))
+    .select(
+        F.col(COL_ID_PRS).alias("id_prs"),
+        F.col(COL_AGE).alias("age_pph"),
+        F.col("annee_mois_part"),
+    )
+    .dropDuplicates(["id_prs", "annee_mois_part"])
+)
+
+presence = (
+    socio.groupBy("id_prs")
+    .agg(
+        F.max(F.when(F.col("annee_mois_part") == MOIS_AVANT_REF, 1).otherwise(0)).alias("top_avril"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_REF, 1).otherwise(0)).alias("top_mai"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_V1, 1).otherwise(0)).alias("top_juin"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_V2, 1).otherwise(0)).alias("top_juillet"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_V2, F.col("age_pph"))).alias("age_arrete"),
+        F.max(F.struct(F.col("annee_mois_part"), F.col("age_pph"))).alias("_derniere_photo"),
+    )
+    .withColumn("age_pph", F.coalesce(F.col("age_arrete"), F.col("_derniere_photo.age_pph")))
+    .drop("age_arrete", "_derniere_photo")
+)
+
+# -----------------------------------------------------------------------------
+# 5. STATUT CLIENT, PAR RAPPORT AU DEBUT DE LA PERIODE (fin mai)
+#    DEJA_CLIENT   : present au socle de fin mai
+#    PROSPECT      : absent fin mai, present en juin ou en juillet
+#    A_INVESTIGUER : absent des quatre socles
+# -----------------------------------------------------------------------------
+population = (
+    benef.join(presence, on="id_prs", how="left")
+    .fillna(0, subset=["top_avril", "top_mai", "top_juin", "top_juillet"])
+    .withColumn(
+        "statut_client",
+        F.when(F.col("top_mai") == 1, F.lit("DEJA_CLIENT"))
+         .when((F.col("top_juin") == 1) | (F.col("top_juillet") == 1), F.lit("PROSPECT"))
+         .otherwise(F.lit("A_INVESTIGUER")),
+    )
+    # Vague d'entree des nouveaux clients : conquis en juin ou en juillet
+    .withColumn(
+        "mois_entree",
+        F.when(F.col("statut_client") != "PROSPECT", F.lit(None).cast("string"))
+         .when(F.col("top_juin") == 1, F.lit(MOIS_V1))
+         .otherwise(F.lit(MOIS_V2)),
+    )
+    # Un deja-client entre en mai n'a qu'un mois d'anciennete au debut de l'offre
+    .withColumn(
+        "anciennete_client",
+        F.when(F.col("statut_client") != "DEJA_CLIENT", F.lit(None).cast("string"))
+         .when(F.col("top_avril") == 1, F.lit("ETABLI"))
+         .otherwise(F.lit("ENTRE_EN_MAI")),
+    )
+    # Coherence : le mois d'entree en relation colle-t-il au mois de l'operation ?
+    .withColumn(
+        "ecart_entree_ope",
+        F.when(F.col("statut_client") != "PROSPECT", F.lit(None).cast("string"))
+         .when(F.col("mois_entree") == F.col("mois_ope"), F.lit("COHERENT"))
+         .otherwise(F.lit("DECALE")),
+    )
+    .withColumn("mois_arrete", F.lit(MOIS_V2))
+)
+
+# -----------------------------------------------------------------------------
+# 6. CONTROLES
+# -----------------------------------------------------------------------------
+population = population.cache()
+
+population.groupBy("statut_client", "mois_entree", "anciennete_client").agg(
+    F.countDistinct("id_prs").alias("nb_clients")
+).orderBy("statut_client", "mois_entree").show(50, truncate=False)
+
+# Croisement mois d'entree x mois de l'operation de frais
+population.groupBy("statut_client", "mois_ope", "ecart_entree_ope").count().orderBy(
+    "statut_client", "mois_ope"
+).show(50, truncate=False)
+
+# Composition des contrats : le cas attendu est 1 DEJA_CLIENT + 1 PROSPECT
+population.groupBy("no_cnt_det").agg(
+    F.sum(F.when(F.col("statut_client") == "DEJA_CLIENT", 1).otherwise(0)).alias("nb_deja"),
+    F.sum(F.when(F.col("statut_client") == "PROSPECT", 1).otherwise(0)).alias("nb_prospect"),
+).groupBy("nb_deja", "nb_prospect").count().orderBy("nb_deja", "nb_prospect").show(20, truncate=False)
+
+# -----------------------------------------------------------------------------
+# 7. ECRITURE
+# -----------------------------------------------------------------------------
+dkuspark.write_with_schema(
+    dataiku.Dataset("populations_beneficiaires_conjoint"),
+    population.select(
+        "id_prs",
+        "no_cnt_det",
+        "offre",
+        "statut_client",
+        "mois_entree",
+        "anciennete_client",
+        "ecart_entree_ope",
+        "dt_ope",
+        "mois_ope",
+        "mois_arrete",
+        "top_avril",
+        "top_mai",
+        "top_juin",
+        "top_juillet",
+        "age_pph",
+    ),
+)
