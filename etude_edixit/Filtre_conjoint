@@ -1,81 +1,39 @@
-# -*- coding: utf-8 -*-
-# =============================================================================
-# Recette 2/3 - Extraction des id_prs : offre CONJOINT
-#   Input   : populations_beneficiaires_conjoint
-#   Outputs : pop_finale_conjoint_deja_client
-#             pop_finale_conjoint_prospect
-# =============================================================================
+Bonjour,
 
-import dataiku
-from dataiku import spark as dkuspark
-from pyspark.sql import SparkSession, functions as F
+Je pars en congés, je te passe le sujet des offres promotionnelles sur la FDC. Voici où j'en suis et ce qui reste à faire.
 
-spark = SparkSession.builder.appName("filtre_pop_conjoint").getOrCreate()
+**Ce qui est fait**
 
-# -----------------------------------------------------------------------------
-# FILTRES
-# -----------------------------------------------------------------------------
-EXCLURE_STATUT_INDETERMINE = True    # A_INVESTIGUER
-EXIGER_PRESENCE_ARRETE     = True    # present fin juillet
-EXCLURE_DEJA_CLIENTS_RECENTS = False # ENTRE_EN_MAI : 1 mois d'anciennete
-EXCLURE_ECART_ENTREE_OPE   = False   # prospects dont l'entree ne colle pas au mois de frais
-AGE_MIN                    = 18      # majeurs uniquement pour une offre conjoint
+Les cinq populations de bénéficiaires sont construites et disponibles en sortie de flow :
 
-pop = dkuspark.get_dataframe(spark, dataiku.Dataset("populations_beneficiaires_conjoint"))
+- Offre conjoint : déjà clients / prospects (deux datasets)
+- Offre diplômé : déjà clients / prospects (deux datasets)
+- Conquête interne : déjà clients (un seul dataset, pas de prospect par construction)
 
+Chaque table contient les id_prs et un libellé de population. Le flow est en trois étapes par offre : construction de la population avec les flags de qualification, puis recette de filtrage qui produit les datasets finaux. Les filtres sont des booléens en tête de script, faciles à réactiver ou à désactiver.
 
-def etape(df, libelle):
-    print("%-45s %s" % (libelle, df.count()))
-    return df
+La règle de qualification retenue : est nouveau client celui qui est absent du socle de fin mai (dernier arrêté avant le début des offres) et présent en juin ou en juillet. On se positionne à fin juillet.
 
+**Ce qui reste à faire**
 
-pop = etape(pop, "beneficiaires conjoint en entree")
+1. Les populations témoins :
+   - pour les déjà clients, la même cible non souscriptrice de l'offre
+   - pour les prospects, la conquête classique sur la même période (et sur la tranche d'âge correspondante pour l'offre diplômé)
 
-if EXCLURE_STATUT_INDETERMINE:
-    pop = etape(pop.filter(F.col("statut_client") != "A_INVESTIGUER"),
-                "- statut indetermine exclu")
+2. Les populations des meilleurs convertisseurs.
 
-if EXIGER_PRESENCE_ARRETE:
-    pop = etape(pop.filter(F.col("top_juillet") == 1),
-                "- absents du socle d'arrete exclus")
+**Les limites identifiées, à garder en tête**
 
-if EXCLURE_DEJA_CLIENTS_RECENTS:
-    pop = etape(pop.filter(F.coalesce(F.col("anciennete_client"), F.lit("")) != "ENTRE_EN_MAI"),
-                "- deja-clients recents exclus")
+La ligne de frais porte un numéro de contrat, pas une personne. Sur une FDC jointe, on ne peut pas savoir lequel des deux titulaires a souscrit : le bénéfice est attribué aux deux par convention. Faute d'un rôle ou d'un rang de titulaire dans le bloc contrat, c'est la seule option.
 
-if EXCLURE_ECART_ENTREE_OPE:
-    pop = etape(pop.filter(F.coalesce(F.col("ecart_entree_ope"), F.lit("")) != "DECALE"),
-                "- prospects a entree decalee exclus")
+Conséquence sur l'offre conjoint : un conjoint qui était déjà client à un autre titre (porteur d'un livret par exemple) est classé en déjà client, alors qu'il est bien le conquis de l'offre. La distinction nouveau client de la banque / nouveau détenteur de FDC n'est pas tranchée. Le contrôle de composition des contrats dans la recette conjoint permet de mesurer l'ampleur du phénomène : si le cas 1 déjà client + 1 prospect domine, la convention tient.
 
-if AGE_MIN:
-    pop = etape(pop.filter(F.col("age_pph").isNull() | (F.col("age_pph") >= AGE_MIN)),
-                "- mineurs exclus")
+Le point le plus sensible pour la suite est la définition de la cible éligible, qui conditionne toute la construction des témoins. Sans règle explicite d'éligibilité, l'écart mesuré reflétera surtout la différence de profil entre cible et non cible, pas l'effet de l'offre.
 
-# -----------------------------------------------------------------------------
-# SORTIES : un dataset par population
-#   pop_finale_conjoint_deja_client
-#   pop_finale_conjoint_prospect
-# -----------------------------------------------------------------------------
-pop = pop.cache()
+Enfin, le recul d'observation est court : deux mois pour le conjoint et la conquête interne, trois semaines pour l'offre diplômé. La grille M / M+1 / M+3 / M+6 n'est pas jouable, au mieux M et M+1.
 
-deja_client = (
-    pop.filter(F.col("statut_client") == "DEJA_CLIENT")
-       .withColumn("population", F.lit("CONJOINT_DEJA_CLIENT"))
-       .select("id_prs", "population")
-       .dropDuplicates(["id_prs"])
-)
+Deux points techniques : la date de la ligne de frais est stockée en yyyymmdd, il faut la caster avant tout filtre sinon la comparaison renvoie zéro ligne. Et la présence client est calculée sur le bloc socio, ce qui suppose qu'il couvre bien l'ensemble des clients à chaque arrêté.
 
-prospect = (
-    pop.filter(F.col("statut_client") == "PROSPECT")
-       .withColumn("population", F.lit("CONJOINT_PROSPECT"))
-       .select("id_prs", "population")
-       .dropDuplicates(["id_prs"])
-)
+Tout est commenté dans les scripts, avec les paramètres regroupés en tête. N'hésite pas si quelque chose bloque.
 
-print("deja clients : %s" % deja_client.count())
-print("prospects    : %s" % prospect.count())
-
-print("intersection : %s" % deja_client.select("id_prs").intersect(prospect.select("id_prs")).count())
-
-dkuspark.write_with_schema(dataiku.Dataset("pop_finale_conjoint_deja_client"), deja_client)
-dkuspark.write_with_schema(dataiku.Dataset("pop_finale_conjoint_prospect"), prospect)
+Bonne continuation,
