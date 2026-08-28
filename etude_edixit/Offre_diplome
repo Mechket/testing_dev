@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Recette Dataiku / PySpark
+# Population BENEFICIAIRE de l'offre DIPLOME (07/07/2026 -> 31/07/2026)
+#
+# A declarer dans la recette :
+#   Inputs  : LISTE_BENEF_DIPLOME, BLOC_SOCIO
+#   Output  : populations_beneficiaires_diplome
+#
+# Sortie : 1 ligne par id_prs, avec
+#   statut_client     = DEJA_CLIENT / PROSPECT / A_INVESTIGUER
+#   anciennete_client = ETABLI / ENTRE_EN_JUIN (deja-clients uniquement)
+#   controle_age      = DANS_LA_CIBLE / TROP_JEUNE / TROP_AGE / AGE_ABSENT
+# =============================================================================
+
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("population_diplome").getOrCreate()
+
+# -----------------------------------------------------------------------------
+# 1. PARAMETRES  ( >>> A ADAPTER <<< )
+# -----------------------------------------------------------------------------
+DS_DIPLOME    = "LISTE_BENEF_DIPLOME"
+DS_BLOC_SOCIO = "BLOC_SOCIO"   # id_prs, age_pph, annee_mois_part
+
+COL_ID_PRS  = "id_prs"
+COL_AGE     = "age_pph"
+
+MOIS_AVANT_M2 = "202605"       # socle de mai : distingue les deja-clients recents
+MOIS_AVANT   = "202606"        # socle de reference "avant offre" (fin juin)
+MOIS_OFFRE   = "202607"        # socle du mois de l'offre (fin juillet) = arrete
+
+# Bornes d'age attendues pour la cible diplome ( >>> A CONFIRMER <<< )
+AGE_CIBLE_MIN = 17
+AGE_CIBLE_MAX = 18
+
+# -----------------------------------------------------------------------------
+# 2. LISTE DES BENEFICIAIRES
+# -----------------------------------------------------------------------------
+benef = (
+    dkuspark.get_dataframe(spark, dataiku.Dataset(DS_DIPLOME))
+    .select(F.col(COL_ID_PRS).alias("id_prs"))
+    .filter(F.col("id_prs").isNotNull())
+)
+
+nb_lignes = benef.count()
+benef = benef.dropDuplicates(["id_prs"])
+nb_uniques = benef.count()
+print("liste diplome : %s lignes, %s id_prs uniques" % (nb_lignes, nb_uniques))
+
+benef = benef.withColumn("offre", F.lit("DIPLOME"))
+
+# -----------------------------------------------------------------------------
+# 3. PRESENCE MENSUELLE + AGE (bloc socio, une seule lecture)
+# -----------------------------------------------------------------------------
+mois_utiles = [MOIS_AVANT_M2, MOIS_AVANT, MOIS_OFFRE]
+
+socio = (
+    dkuspark.get_dataframe(spark, dataiku.Dataset(DS_BLOC_SOCIO))
+    .filter(F.col("annee_mois_part").isin(mois_utiles))
+    .select(
+        F.col(COL_ID_PRS).alias("id_prs"),
+        F.col(COL_AGE).alias("age_pph"),
+        F.col("annee_mois_part"),
+    )
+    .dropDuplicates(["id_prs", "annee_mois_part"])
+)
+
+presence = (
+    socio.groupBy("id_prs")
+    .agg(
+        F.max(F.when(F.col("annee_mois_part") == MOIS_AVANT_M2, 1).otherwise(0)).alias("top_socle_mai"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_AVANT, 1).otherwise(0)).alias("top_socle_avant"),
+        F.max(F.when(F.col("annee_mois_part") == MOIS_OFFRE, 1).otherwise(0)).alias("top_socle_offre"),
+        # age a l'arrete
+        F.max(F.when(F.col("annee_mois_part") == MOIS_OFFRE, F.col("age_pph"))).alias("age_arrete"),
+        # repli : derniere photo disponible si absent de juillet
+        F.max(F.struct(F.col("annee_mois_part"), F.col("age_pph"))).alias("_derniere_photo"),
+    )
+    .withColumn("age_pph", F.coalesce(F.col("age_arrete"), F.col("_derniere_photo.age_pph")))
+    .drop("age_arrete", "_derniere_photo")
+)
+
+# -----------------------------------------------------------------------------
+# 4. STATUT CLIENT
+#    DEJA_CLIENT   : present au socle de fin juin (avant l'offre)
+#    PROSPECT      : absent fin juin, present fin juillet (conquis par l'offre)
+#    A_INVESTIGUER : absent des trois socles -> cle de jointure ou entree tres tardive
+# -----------------------------------------------------------------------------
+population = (
+    benef.join(presence, on="id_prs", how="left")
+    .fillna(0, subset=["top_socle_mai", "top_socle_avant", "top_socle_offre"])
+    .withColumn(
+        "statut_client",
+        F.when(F.col("top_socle_avant") == 1, F.lit("DEJA_CLIENT"))
+         .when(F.col("top_socle_offre") == 1, F.lit("PROSPECT"))
+         .otherwise(F.lit("A_INVESTIGUER")),
+    )
+    # Sous-segment : un deja-client entre en juin n'a qu'un mois d'anciennete au
+    # moment de l'offre, son profil n'est pas comparable a celui d'un client etabli.
+    .withColumn(
+        "anciennete_client",
+        F.when(F.col("statut_client") != "DEJA_CLIENT", F.lit(None).cast("string"))
+         .when(F.col("top_socle_mai") == 1, F.lit("ETABLI"))
+         .otherwise(F.lit("ENTRE_EN_JUIN")),
+    )
+    .withColumn("mois_beneficiaire", F.lit(MOIS_OFFRE))
+    # Controle de coherence de la liste : l'age est-il dans la cible attendue ?
+    .withColumn(
+        "controle_age",
+        F.when(F.col("age_pph").isNull(), F.lit("AGE_ABSENT"))
+         .when(F.col("age_pph") < AGE_CIBLE_MIN, F.lit("TROP_JEUNE"))
+         .when(F.col("age_pph") > AGE_CIBLE_MAX, F.lit("TROP_AGE"))
+         .otherwise(F.lit("DANS_LA_CIBLE")),
+    )
+)
+
+# -----------------------------------------------------------------------------
+# 5. CONTROLES
+# -----------------------------------------------------------------------------
+population = population.cache()
+
+population.groupBy("statut_client", "anciennete_client").agg(
+    F.countDistinct("id_prs").alias("nb_clients")
+).show()
+
+population.groupBy("statut_client", "controle_age").agg(
+    F.countDistinct("id_prs").alias("nb_clients")
+).orderBy("statut_client", "controle_age").show(50, truncate=False)
+
+population.groupBy("statut_client", "age_pph").count().orderBy(
+    "statut_client", "age_pph"
+).show(50, truncate=False)
+
+# -----------------------------------------------------------------------------
+# 6. ECRITURE
+# -----------------------------------------------------------------------------
+dkuspark.write_with_schema(
+    dataiku.Dataset("populations_beneficiaires_diplome"),
+    population.select(
+        "id_prs",
+        "offre",
+        "statut_client",
+        "anciennete_client",
+        "mois_beneficiaire",
+        "top_socle_mai",
+        "top_socle_avant",
+        "top_socle_offre",
+        "age_pph",
+        "controle_age",
+    ),
+)
