@@ -1,0 +1,69 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Recette 1/3 - Extraction des id_prs : offre DIPLOME
+#   Input  : populations_beneficiaires_diplome
+#   Output : pop_finale_diplome  (id_prs, population)
+#
+#   population = DIPLOME_DEJA_CLIENT | DIPLOME_PROSPECT
+# =============================================================================
+
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("filtre_pop_diplome").getOrCreate()
+
+# -----------------------------------------------------------------------------
+# FILTRES ( chacun activable / desactivable )
+# -----------------------------------------------------------------------------
+EXCLURE_STATUT_INDETERMINE = True    # A_INVESTIGUER : statut non qualifiable
+EXCLURE_HORS_CIBLE_AGE     = True    # TROP_JEUNE / TROP_AGE / AGE_ABSENT
+EXIGER_PRESENCE_ARRETE     = True    # present au socle 202607, sinon pas d'indicateurs
+EXCLURE_DEJA_CLIENTS_RECENTS = False # ENTRE_EN_JUIN : 1 mois d'anciennete seulement
+
+pop = dkuspark.get_dataframe(spark, dataiku.Dataset("populations_beneficiaires_diplome"))
+
+
+def etape(df, libelle):
+    print("%-45s %s" % (libelle, df.count()))
+    return df
+
+
+pop = etape(pop, "beneficiaires diplome en entree")
+
+if EXCLURE_STATUT_INDETERMINE:
+    pop = etape(pop.filter(F.col("statut_client") != "A_INVESTIGUER"),
+                "- statut indetermine exclu")
+
+if EXCLURE_HORS_CIBLE_AGE:
+    pop = etape(pop.filter(F.col("controle_age") == "DANS_LA_CIBLE"),
+                "- hors cible d'age exclu")
+
+if EXIGER_PRESENCE_ARRETE:
+    pop = etape(pop.filter(F.col("top_socle_offre") == 1),
+                "- absents du socle d'arrete exclus")
+
+if EXCLURE_DEJA_CLIENTS_RECENTS:
+    pop = etape(pop.filter(F.coalesce(F.col("anciennete_client"), F.lit("")) != "ENTRE_EN_JUIN"),
+                "- deja-clients recents exclus")
+
+# -----------------------------------------------------------------------------
+# SORTIE
+# -----------------------------------------------------------------------------
+sortie = (
+    pop.withColumn(
+        "population",
+        F.when(F.col("statut_client") == "DEJA_CLIENT", F.lit("DIPLOME_DEJA_CLIENT"))
+         .otherwise(F.lit("DIPLOME_PROSPECT")),
+    )
+    .select("id_prs", "population")
+    .dropDuplicates(["id_prs", "population"])
+)
+
+sortie.groupBy("population").count().show(truncate=False)
+
+# Controle : un id_prs ne doit apparaitre que dans une seule population
+doublons = sortie.groupBy("id_prs").count().filter(F.col("count") > 1).count()
+print("id_prs presents dans plusieurs populations : %s" % doublons)
+
+dkuspark.write_with_schema(dataiku.Dataset("pop_finale_diplome"), sortie)
