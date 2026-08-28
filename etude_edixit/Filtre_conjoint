@@ -1,0 +1,81 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Recette 2/3 - Extraction des id_prs : offre CONJOINT
+#   Input   : populations_beneficiaires_conjoint
+#   Outputs : pop_finale_conjoint_deja_client
+#             pop_finale_conjoint_prospect
+# =============================================================================
+
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("filtre_pop_conjoint").getOrCreate()
+
+# -----------------------------------------------------------------------------
+# FILTRES
+# -----------------------------------------------------------------------------
+EXCLURE_STATUT_INDETERMINE = True    # A_INVESTIGUER
+EXIGER_PRESENCE_ARRETE     = True    # present fin juillet
+EXCLURE_DEJA_CLIENTS_RECENTS = False # ENTRE_EN_MAI : 1 mois d'anciennete
+EXCLURE_ECART_ENTREE_OPE   = False   # prospects dont l'entree ne colle pas au mois de frais
+AGE_MIN                    = 18      # majeurs uniquement pour une offre conjoint
+
+pop = dkuspark.get_dataframe(spark, dataiku.Dataset("populations_beneficiaires_conjoint"))
+
+
+def etape(df, libelle):
+    print("%-45s %s" % (libelle, df.count()))
+    return df
+
+
+pop = etape(pop, "beneficiaires conjoint en entree")
+
+if EXCLURE_STATUT_INDETERMINE:
+    pop = etape(pop.filter(F.col("statut_client") != "A_INVESTIGUER"),
+                "- statut indetermine exclu")
+
+if EXIGER_PRESENCE_ARRETE:
+    pop = etape(pop.filter(F.col("top_juillet") == 1),
+                "- absents du socle d'arrete exclus")
+
+if EXCLURE_DEJA_CLIENTS_RECENTS:
+    pop = etape(pop.filter(F.coalesce(F.col("anciennete_client"), F.lit("")) != "ENTRE_EN_MAI"),
+                "- deja-clients recents exclus")
+
+if EXCLURE_ECART_ENTREE_OPE:
+    pop = etape(pop.filter(F.coalesce(F.col("ecart_entree_ope"), F.lit("")) != "DECALE"),
+                "- prospects a entree decalee exclus")
+
+if AGE_MIN:
+    pop = etape(pop.filter(F.col("age_pph").isNull() | (F.col("age_pph") >= AGE_MIN)),
+                "- mineurs exclus")
+
+# -----------------------------------------------------------------------------
+# SORTIES : un dataset par population
+#   pop_finale_conjoint_deja_client
+#   pop_finale_conjoint_prospect
+# -----------------------------------------------------------------------------
+pop = pop.cache()
+
+deja_client = (
+    pop.filter(F.col("statut_client") == "DEJA_CLIENT")
+       .withColumn("population", F.lit("CONJOINT_DEJA_CLIENT"))
+       .select("id_prs", "population")
+       .dropDuplicates(["id_prs"])
+)
+
+prospect = (
+    pop.filter(F.col("statut_client") == "PROSPECT")
+       .withColumn("population", F.lit("CONJOINT_PROSPECT"))
+       .select("id_prs", "population")
+       .dropDuplicates(["id_prs"])
+)
+
+print("deja clients : %s" % deja_client.count())
+print("prospects    : %s" % prospect.count())
+
+print("intersection : %s" % deja_client.select("id_prs").intersect(prospect.select("id_prs")).count())
+
+dkuspark.write_with_schema(dataiku.Dataset("pop_finale_conjoint_deja_client"), deja_client)
+dkuspark.write_with_schema(dataiku.Dataset("pop_finale_conjoint_prospect"), prospect)
