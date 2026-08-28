@@ -1,0 +1,61 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Recette 3/3 - Extraction des id_prs : offre CONQUETE INTERNE
+#   Input  : populations_beneficiaires_conq_interne
+#   Output : pop_finale_conq_interne  (id_prs, population)
+#
+#   population = CONQ_INTERNE_DEJA_CLIENT  (une seule population : pas de prospect)
+# =============================================================================
+
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("filtre_pop_conq_interne").getOrCreate()
+
+# -----------------------------------------------------------------------------
+# FILTRES
+# -----------------------------------------------------------------------------
+EXCLURE_ANOMALIES        = True    # tout ce qui n'est pas DEJA_CLIENT
+EXIGER_PRESENCE_ARRETE   = True    # present fin juillet
+EXCLURE_CLIENTS_RECENTS  = False   # ENTRE_EN_MAI
+AGE_MIN                  = 18
+
+pop = dkuspark.get_dataframe(spark, dataiku.Dataset("populations_beneficiaires_conq_interne"))
+
+
+def etape(df, libelle):
+    print("%-45s %s" % (libelle, df.count()))
+    return df
+
+
+pop = etape(pop, "beneficiaires conquete interne en entree")
+
+if EXCLURE_ANOMALIES:
+    pop = etape(pop.filter(F.col("controle_presence") == "DEJA_CLIENT"),
+                "- anomalies de presence exclues")
+
+if EXIGER_PRESENCE_ARRETE:
+    pop = etape(pop.filter(F.col("top_juillet") == 1),
+                "- absents du socle d'arrete exclus")
+
+if EXCLURE_CLIENTS_RECENTS:
+    pop = etape(pop.filter(F.coalesce(F.col("anciennete_client"), F.lit("")) != "ENTRE_EN_MAI"),
+                "- clients recents exclus")
+
+if AGE_MIN:
+    pop = etape(pop.filter(F.col("age_pph").isNull() | (F.col("age_pph") >= AGE_MIN)),
+                "- mineurs exclus")
+
+# -----------------------------------------------------------------------------
+# SORTIE : pop_finale_conq_interne
+# -----------------------------------------------------------------------------
+sortie = (
+    pop.withColumn("population", F.lit("CONQ_INTERNE_DEJA_CLIENT"))
+       .select("id_prs", "population")
+       .dropDuplicates(["id_prs"])
+)
+
+print("beneficiaires retenus : %s" % sortie.count())
+
+dkuspark.write_with_schema(dataiku.Dataset("pop_finale_conq_interne"), sortie)
