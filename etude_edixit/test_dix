@@ -1,0 +1,361 @@
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+import unicodedata
+import dataiku
+from pyspark.sql.types import *
+from dataiku import spark as dkuspark
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql import SparkSession, HiveContext
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+import random
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
+from pyspark.sql.functions import expr
+import datetime as dt
+from dateutil.relativedelta import relativedelta
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+sparkSession = (SparkSession
+                .builder
+                .config("spark.driver.maxResultSize", '10g')
+                .config('spark.driver.memory', '10g')
+                .config('spark.executor.memory', '2g')
+                .config('spark.executor.instances', 30)
+                .config('hive.exec.dynamic.partition.mode', 'nonstrict')
+                .enableHiveSupport()
+                .getOrCreate())
+sparkSession.conf.set('spark.sql.broadcastTimeout', 3600)
+sparkSession.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc, sparkSession = sparkSession)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+PROJECT_KEY = dataiku.default_project_key() # Nom du projet dans lequel on se trouve
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+var = dataiku.api_client().get_project(PROJECT_KEY).get_variables()
+DATE = 202501 # Date à laquelle on veut réaliser l'étude des clients
+quali_cols = ['lb_type_marche_M', 'lb_anciennete_tr_M', 'lb_fcm_median_tr_M', 'lb_genre_M',
+    'lb_situation_familiale_M', 'lb_cap_jur_M', 'lb_dex_M', 'lb_dr_M',
+    'cd_ptf_M', 'top_pre_cib_M', 'pinv_M', 'cd_seg_com_marche_aff_M',
+    'cd_seg_com_marche_aff_av_fra_M', 'cd_seg_com_top_frag_M',
+    'cd_seg_com_engag_aff_M', 'cd_seg_com_top_nouveau_M', 'cd_filiere_bpe_M',
+    'cd_seg_com_top_mab_M', 'cd_seg_com_top_mab_comp_M', 'cd_cluster_mkt_M',
+    'top_det_gam_ass_vie_M', 'top_det_gam_credit_perso_M', 'top_det_gam_epa_log_M',
+    'top_det_gam_epa_ord_M', 'top_det_gam_iard_M', 'top_det_gam_credit_immo_M',
+    'top_det_gam_prev_M', 'top_det_gam_sante_M', 'top_det_gam_val_mob_M',
+    'top_det_gam_aq_hors_ccp_M', 'top_det_gam_autre_M', 'srf_fnc_inst_tr_M',
+    'top_det_certicode_M', 'top_det_certicode_plus_M', 'top_au_plafond_livret_a_M',
+    'top_au_plafond_livret_jeune_M', 'top_au_plafond_ldd_M', 'top_au_plafond_lep_M',
+    'top_au_plafond_cel_M', 'top_au_plafond_pel_M', 'top_mono_det_ccp_M',
+    'top_det_cel_M', 'top_det_ldd_M', 'top_det_lep_M', 'top_det_livret_a_M',
+    'top_det_livret_b_M', 'top_det_livret_jeune_M', 'top_det_pel_M',
+    'top_det_ccp_M', 'top_det_chequier_M', 'top_det_formule_M',
+    'top_det_formule_simple_M', 'top_det_projet_M', 'top_det_travaux_M',
+    'top_det_auto_credit_M', 'top_det_etudiant_M', 'top_det_rachat_M',
+    'top_det_autres_perso_M', 'top_det_renouvelable_M',
+    'lb_csp_agg_M', 'pinv_M', 'lb_ptf_conseiller_M', 'pnb_tr_2024'
+]
+
+# Colonnes quantitatives (avec suffixe _M)
+quanti_cols = ['age_pph_M', 'fcm_median_M', 'mnt_crd_credit_immo_M', 'mnt_crd_credit_perso_M',
+    'mnt_epa_disp_M', 'mnt_epa_non_disp_M', 'nbr_cnt_tot_M', 'nbr_gam_tot_M',
+    'srf_ass_vie_M', 'srf_ccp_moyen_M', 'srf_epa_log_M', 'srf_epa_ord_M',
+    'srf_fnc_inst_M', 'srf_val_mob_M', 'nbr_cnt_cel_M', 'nbr_cnt_ldd_M',
+    'nbr_cnt_lep_M', 'nbr_cnt_livret_a_M', 'nbr_cnt_livret_b_M', 'nbr_cnt_livret_jeune_M',
+    'nbr_cnt_pel_M', 'mnt_encours_cel_M', 'mnt_encours_ldd_M', 'mnt_encours_lep_M',
+    'mnt_encours_livret_a_M', 'mnt_encours_livret_b_M', 'mnt_encours_livret_jeune_M',
+    'mnt_encours_pel_M', 'nbr_cnt_ccp_M', 'nbr_cnt_chequier_M', 'nbr_cnt_formule_M',
+    'nbr_cnt_formule_simple_M', 'nbr_cnt_projet_M', 'nbr_cnt_travaux_M',
+    'nbr_cnt_auto_credit_M', 'nbr_cnt_etudiant_M', 'nbr_cnt_rachat_M',
+    'nbr_cnt_autres_perso_M', 'nbr_cnt_micro_M', 'nbr_cnt_renouvelable_M',
+    'mnt_crd_projet_M', 'mnt_crd_travaux_M', 'mnt_crd_auto_credit_M',
+    'mnt_crd_etudiant_M', 'mnt_crd_rachat_M', 'mnt_crd_autres_perso_M',
+    'mnt_crd_micro_M', 'mnt_crd_renouvelable_M', 'pnb_ok_bilan_2024'
+]
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Read recipe inputs
+# Read recipe inputs
+table_principale = dataiku.Dataset("table_principale")
+table_principale_df = dkuspark.get_dataframe(sqlContext, table_principale)
+non_beneficiaires_CAEP_RDV_cohortes = dataiku.Dataset("non_beneficiaires_CAEP_RDV_cohortes")
+non_beneficiaires_CAEP_RDV_cohortes_df = dkuspark.get_dataframe(sqlContext, non_beneficiaires_CAEP_RDV_cohortes)
+
+
+
+#table_clients_1 = dataiku.Dataset("table_clients_1")
+#table_clients_1 = dkuspark.get_dataframe(sqlContext, table_clients_1)
+table_clients_1 = table_principale_df.withColumn('id_prs',F.col("id_prs_edixit").cast("int")).select(["id_prs"]+quali_cols+quanti_cols)
+
+#table_clients_2 = dataiku.Dataset("table_clients_2")
+#table_clients_2 = dkuspark.get_dataframe(sqlContext, table_clients_2)
+table_clients_2 = non_beneficiaires_CAEP_RDV_cohortes_df.withColumn('id_prs',F.col("id_prs_non_benef").cast("int")).select(["id_prs"]+quali_cols+quanti_cols)
+
+#bloc_quanti = dataiku.Dataset("bloc_quanti")
+#bloc_quanti = dkuspark.get_dataframe(sqlContext, bloc_quanti)
+#bloc_quali = dataiku.Dataset("bloc_quali")
+#bloc_quali = dkuspark.get_dataframe(sqlContext, bloc_quali)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+def get_freq(df1, df2, variable):
+    "Permet d'obtenir la répartition des modalités pour chaque variable à chaque date"
+
+    if df1.count() > 0 and df2.count() > 0:
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['1'].div(tableau['1'].sum())
+        tableau['perc_pop2'] = tableau['2'].div(tableau['2'].sum())
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    elif df1.count() > 0:
+        df2 = df1
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['1'].div(tableau['1'].sum())
+        tableau['perc_pop2'] = tableau['1']*0
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    elif df2.count() > 0:
+        df1 = df2
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['2']*0
+        tableau['perc_pop2'] = tableau['2'].div(tableau['2'].sum())
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    else:
+        tableau = pd.DataFrame({'indicateur': [variable], 'excel_variable': [variable+ '_.'], 'perc_pop1': [0.0], 'perc_pop2': [0.0]})
+
+    return tableau.loc[:,['indicateur', 'excel_variable', 'perc_pop1', 'perc_pop2']]
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+def get_freq_nb(df1, df2, variable):
+    "Permet d'obtenir la répartition des modalités pour chaque variable à chaque date"
+    
+    if df1.count() > 0 and df2.count() > 0:
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['1']
+        tableau['perc_pop2'] = tableau['2']
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    elif df1.count() > 0:
+        df2 = df1
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['1']
+        tableau['perc_pop2'] = tableau['1']*0
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    elif df2.count() > 0:
+        df1 = df2
+        tableau = (
+            df1
+            .withColumn('origin', F.lit(1))
+            .union(df2.withColumn('origin', F.lit(2)))
+            .crosstab(variable, 'origin')
+            .toPandas()
+        )
+        tableau['perc_pop1'] = tableau['2']*0
+        tableau['perc_pop2'] = tableau['2']
+        tableau['excel_variable'] =  variable + '_' + tableau[variable+'_origin'].astype(str)
+        tableau['indicateur'] = variable
+    else:
+        tableau = pd.DataFrame({'indicateur': [variable], 'excel_variable': [variable+ '_.'], 'perc_pop1': [0.0], 'perc_pop2': [0.0]})
+    
+    return tableau.loc[:,['indicateur', 'excel_variable', 'perc_pop1', 'perc_pop2']]
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# ## TAUX PAR INDICATEUR
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#bloc_quali_1 = bloc_quali.join(clients_1, on = 'id_prs', how = 'inner')
+#bloc_quali_1.persist() # Garde en mémoire la nouvelle table 'bloc_quali' afin d'obtenir de meilleures performances par la suite.
+#bloc_quali_1.count() # Permet d'appliquer '.persist()'
+#bloc_quali_2 = bloc_quali.join(clients_2, on = 'id_prs', how = 'inner')
+#bloc_quali_2.persist() # Garde en mémoire la nouvelle table 'bloc_quali' afin d'obtenir de meilleures performances par la suite.
+#bloc_quali_2.count() # Permet d'appliquer '.persist()'
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# On calcule les répartitions de chaque variables qualitatives
+# Colonnes qualitatives (avec suffixe _M)
+quali_cols = ['lb_type_marche_M', 'lb_anciennete_tr_M', 'lb_fcm_median_tr_M', 'lb_genre_M',
+    'lb_situation_familiale_M', 'lb_cap_jur_M', 'lb_dex_M', 'lb_dr_M',
+    'cd_ptf_M', 'top_pre_cib_M', 'pinv_M', 'cd_seg_com_marche_aff_M',
+    'cd_seg_com_marche_aff_av_fra_M', 'cd_seg_com_top_frag_M',
+    'cd_seg_com_engag_aff_M', 'cd_seg_com_top_nouveau_M', 'cd_filiere_bpe_M',
+    'cd_seg_com_top_mab_M', 'cd_seg_com_top_mab_comp_M', 'cd_cluster_mkt_M',
+    'top_det_gam_ass_vie_M', 'top_det_gam_credit_perso_M', 'top_det_gam_epa_log_M',
+    'top_det_gam_epa_ord_M', 'top_det_gam_iard_M', 'top_det_gam_credit_immo_M',
+    'top_det_gam_prev_M', 'top_det_gam_sante_M', 'top_det_gam_val_mob_M',
+    'top_det_gam_aq_hors_ccp_M', 'top_det_gam_autre_M', 'srf_fnc_inst_tr_M',
+    'top_det_certicode_M', 'top_det_certicode_plus_M', 'top_au_plafond_livret_a_M',
+    'top_au_plafond_livret_jeune_M', 'top_au_plafond_ldd_M', 'top_au_plafond_lep_M',
+    'top_au_plafond_cel_M', 'top_au_plafond_pel_M', 'top_mono_det_ccp_M',
+    'top_det_cel_M', 'top_det_ldd_M', 'top_det_lep_M', 'top_det_livret_a_M',
+    'top_det_livret_b_M', 'top_det_livret_jeune_M', 'top_det_pel_M',
+    'top_det_ccp_M', 'top_det_chequier_M', 'top_det_formule_M',
+    'top_det_formule_simple_M', 'top_det_projet_M', 'top_det_travaux_M',
+    'top_det_auto_credit_M', 'top_det_etudiant_M', 'top_det_rachat_M',
+    'top_det_autres_perso_M', 'top_det_renouvelable_M',
+    'lb_csp_agg_M', 'pinv_M', 'lb_ptf_conseiller_M', 'pnb_tr_2024'
+]
+
+# Colonnes quantitatives (avec suffixe _M)
+quanti_cols = ['age_pph_M', 'fcm_median_M', 'mnt_crd_credit_immo_M', 'mnt_crd_credit_perso_M',
+    'mnt_epa_disp_M', 'mnt_epa_non_disp_M', 'nbr_cnt_tot_M', 'nbr_gam_tot_M',
+    'srf_ass_vie_M', 'srf_ccp_moyen_M', 'srf_epa_log_M', 'srf_epa_ord_M',
+    'srf_fnc_inst_M', 'srf_val_mob_M', 'nbr_cnt_cel_M', 'nbr_cnt_ldd_M',
+    'nbr_cnt_lep_M', 'nbr_cnt_livret_a_M', 'nbr_cnt_livret_b_M', 'nbr_cnt_livret_jeune_M',
+    'nbr_cnt_pel_M', 'mnt_encours_cel_M', 'mnt_encours_ldd_M', 'mnt_encours_lep_M',
+    'mnt_encours_livret_a_M', 'mnt_encours_livret_b_M', 'mnt_encours_livret_jeune_M',
+    'mnt_encours_pel_M', 'nbr_cnt_ccp_M', 'nbr_cnt_chequier_M', 'nbr_cnt_formule_M',
+    'nbr_cnt_formule_simple_M', 'nbr_cnt_projet_M', 'nbr_cnt_travaux_M',
+    'nbr_cnt_auto_credit_M', 'nbr_cnt_etudiant_M', 'nbr_cnt_rachat_M',
+    'nbr_cnt_autres_perso_M', 'nbr_cnt_micro_M', 'nbr_cnt_renouvelable_M',
+    'mnt_crd_projet_M', 'mnt_crd_travaux_M', 'mnt_crd_auto_credit_M',
+    'mnt_crd_etudiant_M', 'mnt_crd_rachat_M', 'mnt_crd_autres_perso_M',
+    'mnt_crd_micro_M', 'mnt_crd_renouvelable_M', 'pnb_ok_bilan_2024'
+]
+
+
+TAUX_PAR_INDICATEUR = pd.DataFrame(columns = ['indicateur', 'excel_variable', 'perc_pop1', 'perc_pop2']) # Initialisation du DataFrame
+for col in [x for x in quali_cols if x != 'id_prs'] :
+    if (col == 'type_carte_M') :
+        TAUX_PAR_INDICATEUR = pd.concat([TAUX_PAR_INDICATEUR, get_freq(table_clients_1.filter(F.col('top_det_ccp_M')=='OUI'), table_clients_2.filter(F.col('top_det_ccp_M')=='OUI'), col)], axis=0, sort=False)
+    elif (col == 'motif_fragilite_M') :
+        TAUX_PAR_INDICATEUR = pd.concat([TAUX_PAR_INDICATEUR, get_freq(table_clients_1.filter(F.col('cd_seg_com_top_frag_M')==1), table_clients_2.filter(F.col('cd_seg_com_top_frag_M')==1), col)], axis=0, sort=False)
+    elif (col == 'frag_marche_M' or col == "nb_filiere_bpe_M") :
+        TAUX_PAR_INDICATEUR = pd.concat([TAUX_PAR_INDICATEUR, get_freq_nb(table_clients_1, table_clients_2, col)], axis=0, sort=False)
+    else :
+        #lb_type_marche_M
+        TAUX_PAR_INDICATEUR = pd.concat([TAUX_PAR_INDICATEUR, get_freq(table_clients_1, table_clients_2, col)], axis=0, sort=False)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+TAUX_PAR_INDICATEUR.loc[TAUX_PAR_INDICATEUR['excel_variable']=='type_carte_M.','excel_variable']='type_carte' # Pour être cohérent avec l'outil SAS et la maquette Excel
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+TAUX_PAR_INDICATEUR.reset_index(drop=True)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#bloc_quali_1.unpersist() # On libère la table de la mémoire
+#bloc_quali_2.unpersist() # On libère la table de la mémoire
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# ## AGREGAT VAR CONTINUES
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#bloc_quanti_1 = bloc_quanti.join(clients_1, on = 'id_prs', how = 'inner')
+#bloc_quanti_1.persist() # Garde en mémoire la nouvelle table 'bloc_quanti' afin d'obtenir de meilleures performances par la suite.
+#bloc_quanti_1.count() # Permet d'appliquer '.persist()'
+#bloc_quanti_2 = bloc_quanti.join(clients_2, on = 'id_prs', how = 'inner')
+#bloc_quanti_2.persist() # Garde en mémoire la nouvelle table 'bloc_quanti' afin d'obtenir de meilleures performances par la suite.
+#bloc_quanti_2.count() # Permet d'appliquer '.persist()'
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+AGREGAT_VAR_CONTINUES = pd.DataFrame(columns = ['indicateur', 'N_POP_1', 'MEAN_POP_1', 'N_POP_2', 'MEAN_POP_2']) # Initialisation du DataFrame
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Pour chaque variable, on calcule le nombre de clients ayant la variable renseignée et supérieur à 0 et la moyennes sur ces clients là.
+l=[]
+for col in [x for x in quanti_cols if x != 'id_prs'] :
+    if (col == 'pnb_ok_bilan_2024'):
+        l.append({'indicateur': col, 'N_POP_1': table_clients_1.filter(F.col(col).isNull()==False).count(), 'N_POP_2': table_clients_2.filter(F.col(col).isNull()==False).count(), 'MEAN_POP_1': table_clients_1.filter(F.col(col).isNull()==False).agg(F.mean(col)).collect()[0][0], 'MEAN_POP_2': table_clients_2.filter(F.col(col).isNull()==False).agg(F.mean(col)).collect()[0][0]})
+    else :
+        l.append({'indicateur': col, 'N_POP_1': table_clients_1.filter((F.col(col).isNull()==False) & (F.col(col)>0)).count(), 'N_POP_2': table_clients_2.filter((F.col(col).isNull()==False) & (F.col(col)>0)).count(), 'MEAN_POP_1': table_clients_1.filter((F.col(col).isNull()==False) & (F.col(col)>0)).agg(F.mean(col)).collect()[0][0], 'MEAN_POP_2': table_clients_2.filter((F.col(col).isNull()==False) & (F.col(col)>0)).agg(F.mean(col)).collect()[0][0]})
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE      
+date_trt = int(dt.date.today().strftime('%Y%m%d'))
+l.append({'indicateur': "date_trt", 'N_POP_1': table_clients_1.count(), 'MEAN_POP_1': date_trt, 'N_POP_2': table_clients_2.count(), 'MEAN_POP_2': date_trt})
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+AGREGAT_VAR_CONTINUES = pd.DataFrame(l, columns = ['indicateur', 'N_POP_1', 'MEAN_POP_1', 'N_POP_2', 'MEAN_POP_2']).sort_values(by='indicateur')
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+#bloc_quanti_1.unpersist() # On libère la table de la mémoire
+#bloc_quanti_2.unpersist() # On libère la table de la mémoire
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: MARKDOWN
+# ## Nouvelle Seg
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+seg_1 = table_clients_1.select(['id_prs', 'cd_seg_com_engag_aff_M', 'cd_seg_com_marche_aff_av_fra_M'])
+seg_2 = table_clients_2.select(['id_prs', 'cd_seg_com_engag_aff_M', 'cd_seg_com_marche_aff_av_fra_M'])
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+temp_1 = seg_1.crosstab("cd_seg_com_engag_aff_M", 'cd_seg_com_marche_aff_av_fra_M').toPandas() # Tableau croisé entre engagement et marché à la date_1.
+temp_2 = seg_2.crosstab("cd_seg_com_engag_aff_M", 'cd_seg_com_marche_aff_av_fra_M').toPandas() # Tableau croisé entre engagement et marché à la date_2.
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+temp_1.set_index('cd_seg_com_engag_aff_M_cd_seg_com_marche_aff_av_fra_M', inplace=True)
+temp_2.set_index('cd_seg_com_engag_aff_M_cd_seg_com_marche_aff_av_fra_M', inplace=True)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# On rajoute les colonnes manquantes pour les marchés non présents dans notre échantillon
+for col in [x for x in ['A', 'B', 'C', 'D', 'E', 'F'] if x not in temp_1.columns.values.tolist()]:
+    temp_1[col] = [0 for i in range(temp_1.shape[0])]
+# On rajoute les lignes manquantes pour les engagements non présents dans notre échantillon
+for i in range(6) :
+    if str(i) not in temp_1.index.values.tolist() :
+        temp_1 = temp_1.reset_index().append({'cd_seg_com_engag_aff_M_cd_seg_com_marche_aff_av_fra_M':str(i), 'A':0, 'B':0, 'C':0, 'D':0, 'E':0, 'F':0}, ignore_index=True).set_index('cd_seg_com_engag_aff_cd_seg_com_marche_aff_av_fra')
+
+# On rajoute les colonnes manquantes pour les marchés non présents dans notre échantillon
+for col in [x for x in ['A', 'B', 'C', 'D', 'E', 'F'] if x not in temp_2.columns.values.tolist()]:
+    temp_2[col] = [0 for i in range(temp_2.shape[0])]
+# On rajoute les lignes manquantes pour les engagements non présents dans notre échantillon
+for i in range(6) :
+    if str(i) not in temp_2.index.values.tolist() :
+        temp_2 = temp_2.reset_index().append({'cd_seg_com_engag_aff_cd_seg_com_marche_aff_av_fra':str(i), 'A':0, 'B':0, 'C':0, 'D':0, 'E':0, 'F':0}, ignore_index=True).set_index('cd_seg_com_engag_aff_cd_seg_com_marche_aff_av_fra')
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+nouvelle_seg = pd.DataFrame(columns = ['iable', 'n_pop_1', 'n_pop_2'], dtype = float)
+for i in ['A', 'B', 'C', 'D', 'E', 'F']:
+    for j in range(6):
+        nouvelle_seg = nouvelle_seg.append({'iable': i+str(j), 'n_pop_1': temp_1[i][str(j)], 'n_pop_2': temp_2[i][str(j)]}, ignore_index=True)
+nouvelle_seg['indicateur']= ['Nouvelles_seg' for i in range(nouvelle_seg.shape[0])]
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# On calcule les pourcentage pour chaque croisement segment/marché
+nouvelle_seg['perc_1'] = nouvelle_seg['n_pop_1'].div(nouvelle_seg['n_pop_1'].sum(axis=0), axis=0)
+nouvelle_seg['perc_2'] = nouvelle_seg['n_pop_2'].div(nouvelle_seg['n_pop_2'].sum(axis=0), axis=0)
+
+nouvelle_seg = nouvelle_seg.loc[:, ['indicateur', 'iable', 'perc_1', 'n_pop_1', 'perc_2', 'n_pop_2']]
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# # Write recipe outputs
+TAUX_PAR_INDICATEUR_2pop = dataiku.Dataset("TAUX_PAR_INDICATEUR_2pop")
+TAUX_PAR_INDICATEUR_2pop.write_with_schema(TAUX_PAR_INDICATEUR)
+
+AGREGAT_VAR_CONTINUES_2pop = dataiku.Dataset("AGREGAT_VAR_CONTINUES_2pop")
+AGREGAT_VAR_CONTINUES_2pop.write_with_schema(AGREGAT_VAR_CONTINUES)
+
+NOUVELLE_SEG_2pop = dataiku.Dataset("NOUVELLE_SEG_2pop")
+NOUVELLE_SEG_2pop.write_with_schema(nouvelle_seg)
