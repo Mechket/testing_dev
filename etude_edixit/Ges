@@ -1,257 +1,232 @@
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# Recette PySpark Dataiku : étude descriptive des bénéficiaires de gestes co
-# Sortie : un fichier Excel déposé dans un dossier géré (managed folder)
+# Étude descriptive des bénéficiaires de gestes co — Python (pandas + openpyxl)
+#
+# Entrée  : un fichier CSV ou Excel avec les colonnes
+#           men_div_ope, dt_cre_evt, num_cnt_ben, id_prs, rank, mnt_ope
+# Sortie  : un fichier Excel avec les tableaux descriptifs
+#
+# Utilisation : python descriptif_gestes_co.py  (après avoir réglé les paramètres)
+#          ou   python descriptif_gestes_co.py mon_fichier.csv
 # ==============================================================================
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-import io
+import re
+import sys
 import datetime as dt
 
 import pandas as pd
-import pyspark.sql.functions as F
-from pyspark.sql.window import Window
 
-try:
-    import dataiku
-    from dataiku import spark as dkuspark
-    from pyspark import SparkContext
-    from pyspark.sql import SQLContext
-except ImportError:          # exécution hors Dataiku (tests)
-    dataiku = None
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # ============================== PARAMÈTRES À ADAPTER ==========================
-DATASET_ENTREE = "gestes_co"            # nom du dataset d'entrée dans le flow
-DOSSIER_SORTIE = "rapport_gestes_co"    # nom (ou id) du dossier géré de sortie
-NOM_FICHIER = "descriptif_gestes_co_{}.xlsx".format(dt.date.today().strftime("%Y%m%d"))
+FICHIER_ENTREE = "gestes_co.csv"          # .csv, .xlsx ou .xls
+SEPARATEUR_CSV = ";"                      # séparateur si CSV
+FICHIER_SORTIE = "descriptif_gestes_co_{}.xlsx".format(dt.date.today().strftime("%Y%m%d"))
 
-COL_RIB = "men_div_ope"     # IBAN / RIB (FR...)
+COL_RIB = "men_div_ope"     # RIB / IBAN (FR...) -> sert au comptage des comptes
 COL_DATE = "dt_cre_evt"     # date de l'événement (ex. 10JUN2026)
 COL_CNT = "num_cnt_ben"     # numéro de contrat (sous-chaîne du RIB)
 COL_PRS = "id_prs"          # id personne
-COL_RANK = "rank"           # 1 = personne la plus engagée du contrat
+COL_RANK = "rank"           # 1 = personne la plus engagée du compte
 COL_MNT = "mnt_ope"         # montant du geste co
-COL_SEG = "cd_seg_com_engag_aff_M"  # segment d'engagement (ignoré s'il n'existe pas)
+COL_SEG = "cd_seg_com_engag_aff_M"  # segment d'engagement (onglet ignoré si absent)
 
-# Tranches de montant (en euros) : [0-10[, [10-20[, ..., 1000 et +
+# Tranches de montant (en euros) : [0 ; 10[, [10 ; 20[, ..., 1000 et +
 BORNES_MONTANT = [0, 10, 20, 50, 100, 200, 500, 1000]
 
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+
+# ============================== LECTURE ======================================
+def lire(chemin):
+    if chemin.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        df = pd.read_excel(chemin, dtype={COL_RIB: str, COL_CNT: str, COL_PRS: str})
+    else:
+        df = pd.read_csv(chemin, sep=SEPARATEUR_CSV, dtype={COL_RIB: str, COL_CNT: str, COL_PRS: str},
+                         encoding="utf-8-sig", decimal=",")
+    manquantes = [c for c in [COL_RIB, COL_DATE, COL_CNT, COL_PRS, COL_RANK, COL_MNT] if c not in df.columns]
+    if manquantes:
+        raise ValueError("Colonnes absentes du fichier : {}\nColonnes trouvées : {}".format(manquantes, list(df.columns)))
+    return df
+
+
 # ============================== PRÉPARATION ==================================
 MOIS = {"jan": 1, "feb": 2, "fev": 2, "mar": 3, "apr": 4, "avr": 4, "may": 5, "mai": 5,
         "jun": 6, "jul": 7, "aug": 8, "aou": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+REGEX_DATE = re.compile(r"^\s*(\d{1,2})[\s\-/\.]*([A-Za-zéÉûÛ]+)\.?[\s\-/\.]*(\d{2,4})")
 
 
-def parse_date(df, col):
-    """Convertit '10JUN2026', '10 jun 2026', '10-JUN-26'... en date Spark.
-    Accepte aussi une colonne déjà en date/timestamp, ou 'yyyy-MM-dd' / 'dd/MM/yyyy'."""
-    type_col = dict(df.dtypes)[col]
-    if type_col in ("date", "timestamp"):
-        return df.withColumn("date_evt", F.to_date(F.col(col)))
-
-    s = F.trim(F.col(col).cast("string"))
-    regex = r"^(\d{1,2})[\s\-/\.]*([A-Za-zéÉûÛ]+)\.?[\s\-/\.]*(\d{2,4})"
-    jour = F.regexp_extract(s, regex, 1)
-    lib_mois = F.translate(F.lower(F.regexp_extract(s, regex, 2)), "éû", "eu")
-    annee = F.regexp_extract(s, regex, 3)
-
-    carte_mois = F.create_map(*[x for k, v in MOIS.items() for x in (F.lit(k), F.lit(v))])
-    mois = (F.when(lib_mois.startswith("juil"), F.lit(7))
-             .when(lib_mois.startswith("juin"), F.lit(6))
-             .otherwise(carte_mois[F.substring(lib_mois, 1, 3)]))
-    annee4 = F.when(F.length(annee) == 2, F.concat(F.lit("20"), annee)).otherwise(annee)
-
-    date_texte = F.to_date(F.concat_ws("-", annee4, F.lpad(mois.cast("string"), 2, "0"),
-                                       F.lpad(jour, 2, "0")), "yyyy-MM-dd")
-    return df.withColumn("date_evt", F.coalesce(
-        F.when(jour != "", date_texte),
-        F.to_date(s, "yyyy-MM-dd"),
-        F.to_date(s, "dd/MM/yyyy"),
-    ))
+def lire_une_date(v):
+    """'10JUN2026', '10 jun 2026', '10-JUN-26', '10 juin 2026' -> date. Sinon tentative standard."""
+    if pd.isna(v):
+        return pd.NaT
+    if isinstance(v, (dt.date, dt.datetime, pd.Timestamp)):
+        return pd.Timestamp(v)
+    s = str(v).strip()
+    m = REGEX_DATE.match(s)
+    if m:
+        jour, lib, annee = m.groups()
+        lib = lib.lower().replace("é", "e").replace("û", "u")
+        mois = 7 if lib.startswith("juil") else 6 if lib.startswith("juin") else MOIS.get(lib[:3])
+        if mois:
+            annee = int(annee) + 2000 if len(annee) == 2 else int(annee)
+            try:
+                return pd.Timestamp(year=annee, month=mois, day=int(jour))
+            except ValueError:
+                return pd.NaT
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
-def tranche_montant(col, bornes):
-    expr = F.when(col.isNull(), F.lit("Montant manquant")).when(col < 0, F.lit("Négatif"))
-    for i in range(len(bornes) - 1):
-        lib = "{:02d}. [{} ; {}[".format(i + 1, bornes[i], bornes[i + 1])
-        expr = expr.when(col < bornes[i + 1], F.lit(lib))
-    return expr.otherwise(F.lit("{:02d}. {} et +".format(len(bornes), bornes[-1])))
+def tranche_montant(x):
+    if pd.isna(x):
+        return "Montant manquant"
+    if x < 0:
+        return "Négatif"
+    for i in range(len(BORNES_MONTANT) - 1):
+        if x < BORNES_MONTANT[i + 1]:
+            return "{:02d}. [{} ; {}[".format(i + 1, BORNES_MONTANT[i], BORNES_MONTANT[i + 1])
+    return "{:02d}. {} et +".format(len(BORNES_MONTANT), BORNES_MONTANT[-1])
 
 
 def preparer(df):
-    df = parse_date(df, COL_DATE)
-    df = (df.withColumn(COL_MNT, F.col(COL_MNT).cast("double"))
-            .withColumn("mois_evt", F.date_format("date_evt", "yyyy-MM"))
-            .withColumn("tranche_mnt", tranche_montant(F.col(COL_MNT), BORNES_MONTANT)))
+    df = df.copy()
+    for c in (COL_RIB, COL_CNT, COL_PRS):
+        df[c] = df[c].astype("string").str.strip().replace("", pd.NA)
+    df["date_evt"] = df[COL_DATE].map(lire_une_date)
+    df["mois_evt"] = df["date_evt"].dt.strftime("%Y-%m")
+    if df[COL_MNT].dtype == object:
+        df[COL_MNT] = df[COL_MNT].astype(str).str.replace(" ", "").str.replace(",", ".")
+    df[COL_MNT] = pd.to_numeric(df[COL_MNT], errors="coerce")
+    df[COL_RANK] = pd.to_numeric(df[COL_RANK], errors="coerce")
+    df["tranche_mnt"] = df[COL_MNT].map(tranche_montant)
 
-    # Nombre de personnes distinctes par contrat -> compte joint / individuel
-    nb_prs = df.groupBy(COL_CNT).agg(F.countDistinct(COL_PRS).alias("nb_titulaires"))
-    df = (df.join(nb_prs, on=COL_CNT, how="left")
-            .withColumn("type_compte",
-                        F.when(F.col("nb_titulaires") == 0, "Sans personne rattachée")
-                         .when(F.col("nb_titulaires") == 1, "Individuel")
-                         .when(F.col("nb_titulaires") == 2, "Joint (2 titulaires)")
-                         .otherwise("Joint (3 titulaires et +)")))
+    # Nombre de personnes distinctes par RIB -> compte joint / individuel
+    df["nb_titulaires"] = df.groupby(COL_RIB, dropna=False)[COL_PRS].transform("nunique")
+    df["type_compte"] = pd.cut(df["nb_titulaires"], [-1, 0, 1, 2, float("inf")],
+                               labels=["Sans personne rattachée", "Individuel",
+                                       "Joint (2 titulaires)", "Joint (3 titulaires et +)"]).astype(str)
     return df
 
 
 def evenements(df):
-    """Une ligne par geste co : on garde la personne de rang 1 (la plus engagée).
-    Les contrats sans personne rattachée sont gardés (une seule ligne)."""
-    ev = df.filter((F.col(COL_RANK) == 1) | F.col(COL_PRS).isNull())
-    # Sécurité si plusieurs personnes sont ex aequo au rang 1
-    w = Window.partitionBy(COL_RIB, COL_CNT, COL_DATE, COL_MNT).orderBy(F.col(COL_PRS).asc_nulls_last())
-    return ev.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
+    """Une ligne par geste co : la personne de rang 1 (la plus engagée).
+    Les comptes sans personne rattachée sont gardés. Ex aequo au rang 1 -> une seule ligne."""
+    ev = df[(df[COL_RANK] == 1) | df[COL_PRS].isna()]
+    ev = ev.sort_values(COL_PRS, na_position="last")
+    return ev.drop_duplicates(subset=[COL_RIB, COL_CNT, COL_DATE, COL_MNT], keep="first")
 
 
-def stats_montant(df, prefixe=""):
-    q = F.expr("percentile_approx({}, array(0.25, 0.5, 0.75), 10000)".format(COL_MNT))
-    return [
-        F.sum(COL_MNT).alias(prefixe + "montant_total"),
-        F.avg(COL_MNT).alias(prefixe + "montant_moyen"),
-        q.getItem(1).alias(prefixe + "montant_median"),
-    ]
+def stats_montant(g):
+    return g.agg(montant_total=(COL_MNT, "sum"), montant_moyen=(COL_MNT, "mean"),
+                 montant_median=(COL_MNT, "median"))
 
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+
 # ============================== INDICATEURS ==================================
-
-
 def calculer_tableaux(brut):
-    df = preparer(brut).persist()
-    ev = evenements(df).persist()
+    df = preparer(brut)
+    ev = evenements(df)
     tab = {}
 
     # --- Synthèse ---
-    g = ev.agg(F.count("*").alias("n"), F.sum(COL_MNT).alias("tot"), F.avg(COL_MNT).alias("moy"),
-               F.expr("percentile_approx({}, 0.5, 10000)".format(COL_MNT)).alias("med"),
-               F.min(COL_MNT).alias("mini"), F.max(COL_MNT).alias("maxi"),
-               F.min("date_evt").alias("d1"), F.max("date_evt").alias("d2")).collect()[0]
-    contrats = df.select(COL_CNT, "type_compte").distinct().toPandas()
-    synthese = [
-        ("Période couverte", "{} au {}".format(g["d1"], g["d2"])),
-        ("Nombre de gestes co", g["n"]),
-        ("Nombre de contrats bénéficiaires", len(contrats)),
-        ("  dont comptes individuels", int((contrats["type_compte"] == "Individuel").sum())),
-        ("  dont comptes joints", int(contrats["type_compte"].str.startswith("Joint").sum())),
-        ("Nombre de bénéficiaires principaux (rang 1)", ev.filter(F.col(COL_PRS).isNotNull()).select(COL_PRS).distinct().count()),
-        ("Nombre de personnes concernées (tous titulaires)", df.filter(F.col(COL_PRS).isNotNull()).select(COL_PRS).distinct().count()),
-        ("Montant total (€)", g["tot"]),
-        ("Montant moyen (€)", g["moy"]),
-        ("Montant médian (€)", g["med"]),
-        ("Montant minimum (€)", g["mini"]),
-        ("Montant maximum (€)", g["maxi"]),
-    ]
-    tab["Synthese"] = pd.DataFrame(synthese, columns=["Indicateur", "Valeur"])
+    comptes = df.drop_duplicates(COL_RIB)[[COL_RIB, "type_compte"]]
+    m = ev[COL_MNT]
+    tab["Synthese"] = pd.DataFrame([
+        ("Période couverte", "{:%d/%m/%Y} au {:%d/%m/%Y}".format(ev["date_evt"].min(), ev["date_evt"].max())
+         if ev["date_evt"].notna().any() else "Dates non lues"),
+        ("Nombre de comptes bénéficiaires (RIB distincts)", comptes[COL_RIB].nunique()),
+        ("  dont comptes individuels", int((comptes["type_compte"] == "Individuel").sum())),
+        ("  dont comptes joints", int(comptes["type_compte"].str.startswith("Joint").sum())),
+        ("Nombre d'opérations de geste co", len(ev)),
+        ("Nombre de bénéficiaires principaux (rang 1)", ev[COL_PRS].nunique()),
+        ("Nombre de personnes concernées (tous titulaires)", df[COL_PRS].nunique()),
+        ("Montant total (€)", m.sum()),
+        ("Montant moyen (€)", m.mean()),
+        ("Montant médian (€)", m.median()),
+        ("Montant minimum (€)", m.min()),
+        ("Montant maximum (€)", m.max()),
+    ], columns=["Indicateur", "Valeur"])
 
-    # --- Par mois ---
-    par_mois = (ev.groupBy("mois_evt").agg(
-        F.count("*").alias("nb_gestes"),
-        F.countDistinct(COL_CNT).alias("nb_contrats"),
-        F.countDistinct(COL_PRS).alias("nb_beneficiaires"),
-        F.sum(F.when(F.col("type_compte").startswith("Joint"), 1).otherwise(0)).alias("nb_gestes_comptes_joints"),
-        *stats_montant(ev)).toPandas().sort_values("mois_evt"))
-    tous_titulaires = (df.groupBy("mois_evt").agg(F.countDistinct(COL_PRS).alias("nb_personnes_tous_titulaires"))
-                         .toPandas())
-    par_mois = par_mois.merge(tous_titulaires, on="mois_evt", how="left")
-    par_mois["part_comptes_joints"] = par_mois["nb_gestes_comptes_joints"] / par_mois["nb_gestes"]
-    par_mois["nb_gestes_cumules"] = par_mois["nb_gestes"].cumsum()
-    par_mois["montant_cumule"] = par_mois["montant_total"].cumsum()
-    par_mois["mois_evt"] = par_mois["mois_evt"].fillna("Date non lue")
-    tab["Par_mois"] = par_mois[["mois_evt", "nb_gestes", "nb_contrats", "nb_beneficiaires",
-                                "nb_personnes_tous_titulaires", "nb_gestes_comptes_joints",
-                                "part_comptes_joints", "montant_total", "montant_moyen",
-                                "montant_median", "nb_gestes_cumules", "montant_cumule"]]
+    # --- Par mois : comptes bénéficiaires (RIB distincts) ---
+    par_mois = (ev.assign(mois_evt=ev["mois_evt"].fillna("Date non lue"))
+                  .groupby("mois_evt")[COL_RIB].nunique().rename("nb_comptes").reset_index()
+                  .sort_values("mois_evt"))
+    total = pd.DataFrame([{"mois_evt": "Total période", "nb_comptes": ev[COL_RIB].nunique()}])
+    tab["Par_mois"] = pd.concat([par_mois, total], ignore_index=True)
 
     # --- Distribution des montants ---
     niveaux = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
-    valeurs = ev.filter(F.col(COL_MNT).isNotNull()).approxQuantile(COL_MNT, niveaux, 0.0001)
-    tab["Quantiles"] = pd.DataFrame({"Quantile": ["P{}".format(int(q * 100)) for q in niveaux],
-                                     "Montant (€)": valeurs})
-    tranches = (ev.groupBy("tranche_mnt").agg(F.count("*").alias("nb_gestes"),
-                                              F.sum(COL_MNT).alias("montant_total"))
-                  .toPandas().sort_values("tranche_mnt"))
-    tranches["part_gestes"] = tranches["nb_gestes"] / tranches["nb_gestes"].sum()
+    tab["Quantiles"] = pd.DataFrame({"Quantile": ["P{}".format(int(round(q * 100))) for q in niveaux],
+                                     "Montant (€)": m.quantile(niveaux).values})
+    tranches = (ev.groupby("tranche_mnt").agg(nb_operations=(COL_MNT, "size"), nb_comptes=(COL_RIB, "nunique"),
+                                              montant_total=(COL_MNT, "sum"))
+                  .reset_index().sort_values("tranche_mnt"))
+    tranches["part_operations"] = tranches["nb_operations"] / tranches["nb_operations"].sum()
     tranches["part_montant"] = tranches["montant_total"] / tranches["montant_total"].sum()
     tab["Tranches"] = tranches.rename(columns={"tranche_mnt": "tranche_montant"})
 
     # --- Comptes joints vs individuels ---
-    joints = (ev.groupBy("type_compte").agg(
-        F.countDistinct(COL_CNT).alias("nb_contrats"),
-        F.count("*").alias("nb_gestes"),
-        *stats_montant(ev)).toPandas().sort_values("type_compte"))
-    joints["part_contrats"] = joints["nb_contrats"] / joints["nb_contrats"].sum()
-    joints["gestes_par_contrat"] = joints["nb_gestes"] / joints["nb_contrats"]
-    tab["Comptes_joints"] = joints
+    g = ev.groupby("type_compte")
+    joints = g.agg(nb_comptes=(COL_RIB, "nunique"), nb_operations=(COL_MNT, "size")).join(stats_montant(g)).reset_index()
+    joints["part_comptes"] = joints["nb_comptes"] / joints["nb_comptes"].sum()
+    joints["operations_par_compte"] = joints["nb_operations"] / joints["nb_comptes"]
+    tab["Comptes_joints"] = joints[["type_compte", "nb_comptes", "part_comptes", "nb_operations",
+                                    "operations_par_compte", "montant_total", "montant_moyen", "montant_median"]]
 
-    # --- Récurrence : combien de gestes par contrat ---
-    par_cnt = ev.groupBy(COL_CNT).agg(F.count("*").alias("n"), F.sum(COL_MNT).alias("mnt"))
-    recur = (par_cnt.withColumn("nb_gestes_par_contrat",
-                                F.when(F.col("n") >= 5, "5 et +").otherwise(F.col("n").cast("string")))
-             .groupBy("nb_gestes_par_contrat")
-             .agg(F.count("*").alias("nb_contrats"), F.avg("mnt").alias("montant_cumule_moyen"))
-             .toPandas().sort_values("nb_gestes_par_contrat"))
-    recur["part_contrats"] = recur["nb_contrats"] / recur["nb_contrats"].sum()
-    tab["Recurrence"] = recur
+    # --- Récurrence : nombre de gestes co par compte ---
+    par_rib = ev.groupby(COL_RIB).agg(n=(COL_MNT, "size"), mnt=(COL_MNT, "sum"))
+    par_rib["nb_operations_par_compte"] = par_rib["n"].map(lambda n: "5 et +" if n >= 5 else str(n))
+    recur = (par_rib.groupby("nb_operations_par_compte")
+                    .agg(nb_comptes=("n", "size"), montant_cumule_moyen=("mnt", "mean")).reset_index())
+    recur["part_comptes"] = recur["nb_comptes"] / recur["nb_comptes"].sum()
+    tab["Recurrence"] = recur[["nb_operations_par_compte", "nb_comptes", "part_comptes", "montant_cumule_moyen"]]
 
     # --- Jour de la semaine ---
-    jours = (ev.filter(F.col("date_evt").isNotNull())
-               .withColumn("num_jour", F.dayofweek("date_evt"))
-               .groupBy("num_jour").agg(F.count("*").alias("nb_gestes"), F.avg(COL_MNT).alias("montant_moyen"))
-               .toPandas().sort_values("num_jour"))
-    noms = {1: "7. Dimanche", 2: "1. Lundi", 3: "2. Mardi", 4: "3. Mercredi", 5: "4. Jeudi", 6: "5. Vendredi", 7: "6. Samedi"}
-    jours["jour"] = jours["num_jour"].map(noms)
-    jours["part_gestes"] = jours["nb_gestes"] / jours["nb_gestes"].sum()
-    tab["Jour_semaine"] = jours.sort_values("jour")[["jour", "nb_gestes", "part_gestes", "montant_moyen"]]
+    noms = ["1. Lundi", "2. Mardi", "3. Mercredi", "4. Jeudi", "5. Vendredi", "6. Samedi", "7. Dimanche"]
+    e = ev[ev["date_evt"].notna()]
+    jours = (e.assign(jour=e["date_evt"].dt.dayofweek.map(dict(enumerate(noms))))
+              .groupby("jour").agg(nb_comptes=(COL_RIB, "nunique"), nb_operations=(COL_MNT, "size")).reset_index())
+    jours["part_operations"] = jours["nb_operations"] / jours["nb_operations"].sum()
+    tab["Jour_semaine"] = jours
 
     # --- Segment d'engagement du bénéficiaire principal ---
     if COL_SEG in df.columns:
-        seg = (ev.groupBy(COL_SEG).agg(F.countDistinct(COL_PRS).alias("nb_beneficiaires"),
-                                       F.count("*").alias("nb_gestes"), *stats_montant(ev))
-                 .toPandas().sort_values(COL_SEG))
+        g = ev.groupby(COL_SEG)
+        seg = g.agg(nb_beneficiaires=(COL_PRS, "nunique"), nb_comptes=(COL_RIB, "nunique"),
+                    nb_operations=(COL_MNT, "size")).join(stats_montant(g)).reset_index()
         seg["part_beneficiaires"] = seg["nb_beneficiaires"] / seg["nb_beneficiaires"].sum()
         tab["Engagement"] = seg
 
     # --- Contrôles qualité ---
-    nb_rang1 = df.filter(F.col(COL_RANK) == 1).count()
+    rib_contient_cnt = [str(c) in str(r) for r, c in zip(ev[COL_RIB], ev[COL_CNT])]
     ctrl = [
-        ("Lignes du dataset (toutes personnes)", df.count()),
-        ("Lignes de rang 1 avant dédoublonnage", nb_rang1),
-        ("Gestes retenus (une ligne par geste)", ev.count()),
-        ("Lignes sans id personne", df.filter(F.col(COL_PRS).isNull()).count()),
-        ("Dates non lues (date_evt vide)", ev.filter(F.col("date_evt").isNull()).count()),
-        ("Montants manquants", ev.filter(F.col(COL_MNT).isNull()).count()),
-        ("Montants nuls ou négatifs", ev.filter(F.col(COL_MNT) <= 0).count()),
-        ("Contrats absents du RIB", ev.filter(F.instr(F.col(COL_RIB), F.col(COL_CNT)) == 0).count()),
-        ("Contrats à 3 titulaires et +", df.filter(F.col("nb_titulaires") >= 3).select(COL_CNT).distinct().count()),
+        ("Lignes du fichier (toutes personnes)", len(df)),
+        ("Lignes de rang 1", int((df[COL_RANK] == 1).sum())),
+        ("Opérations retenues (une ligne par geste)", len(ev)),
+        ("Lignes sans id personne", int(df[COL_PRS].isna().sum())),
+        ("Lignes sans RIB", int(df[COL_RIB].isna().sum())),
+        ("Dates non lues", int(ev["date_evt"].isna().sum())),
+        ("Montants manquants", int(m.isna().sum())),
+        ("Montants nuls ou négatifs", int((m <= 0).sum())),
+        ("Contrats absents du RIB", rib_contient_cnt.count(False)),
+        ("Comptes à 3 titulaires et +", df.loc[df["nb_titulaires"] >= 3, COL_RIB].nunique()),
     ]
-    exemples = (ev.filter(F.col("date_evt").isNull() & F.col(COL_DATE).isNotNull())
-                  .select(F.col(COL_DATE).cast("string").alias("v")).distinct().limit(5).toPandas()["v"].tolist())
-    if exemples:
+    exemples = ev.loc[ev["date_evt"].isna() & ev[COL_DATE].notna(), COL_DATE].astype(str).unique()[:5]
+    if len(exemples):
         ctrl.append(("Exemples de dates non lues", " | ".join(exemples)))
     tab["Controles"] = pd.DataFrame(ctrl, columns=["Contrôle", "Valeur"])
-
-    df.unpersist()
-    ev.unpersist()
     return tab
 
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+
 # ============================== EXPORT EXCEL =================================
 LIBELLES = {
-    "mois_evt": "Mois", "nb_gestes": "Nb gestes co", "nb_contrats": "Nb contrats",
-    "nb_beneficiaires": "Nb bénéficiaires (rang 1)", "nb_personnes_tous_titulaires": "Nb personnes (tous titulaires)",
-    "nb_gestes_comptes_joints": "Nb gestes comptes joints", "part_comptes_joints": "Part comptes joints",
+    "mois_evt": "Mois", "nb_comptes": "Nb comptes bénéficiaires (RIB distincts)",
+    "nb_operations": "Nb opérations", "part_operations": "Part des opérations",
+    "nb_beneficiaires": "Nb bénéficiaires (rang 1)",
     "montant_total": "Montant total (€)", "montant_moyen": "Montant moyen (€)", "montant_median": "Montant médian (€)",
-    "nb_gestes_cumules": "Nb gestes cumulés", "montant_cumule": "Montant cumulé (€)",
-    "tranche_montant": "Tranche de montant", "part_gestes": "Part des gestes", "part_montant": "Part du montant",
-    "type_compte": "Type de compte", "part_contrats": "Part des contrats", "gestes_par_contrat": "Gestes par contrat",
-    "nb_gestes_par_contrat": "Nb gestes par contrat", "montant_cumule_moyen": "Montant cumulé moyen (€)",
+    "tranche_montant": "Tranche de montant", "part_montant": "Part du montant",
+    "type_compte": "Type de compte", "part_comptes": "Part des comptes", "operations_par_compte": "Opérations par compte",
+    "nb_operations_par_compte": "Nb gestes co par compte", "montant_cumule_moyen": "Montant cumulé moyen (€)",
     "jour": "Jour", "part_beneficiaires": "Part des bénéficiaires", COL_SEG: "Segment d'engagement",
 }
 TITRES = {
-    "Synthese": "Synthèse des gestes co", "Par_mois": "Évolution mensuelle",
+    "Synthese": "Synthèse des gestes co", "Par_mois": "Comptes bénéficiaires par mois",
     "Distribution_montants": "Distribution des montants", "Comptes_joints": "Comptes joints vs individuels",
-    "Recurrence": "Nombre de gestes co par contrat", "Jour_semaine": "Répartition par jour de la semaine",
+    "Recurrence": "Nombre de gestes co par compte", "Jour_semaine": "Répartition par jour de la semaine",
     "Engagement": "Bénéficiaires par segment d'engagement", "Controles": "Contrôles qualité des données",
 }
 
@@ -259,7 +234,7 @@ TITRES = {
 def ecrire_excel(tab, sortie):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart import BarChart, Reference
     from openpyxl.utils import get_column_letter
 
     bleu, gris = "1F4E79", "D9D9D9"
@@ -267,13 +242,18 @@ def ecrire_excel(tab, sortie):
     bord = Border(bottom=Side(style="thin", color=gris))
 
     def format_col(nom):
-        if nom.startswith("part_") or nom.startswith("Part"):
+        if nom.startswith(("part_", "Part")):
             return "0.0%"
-        if "montant" in nom or "Montant" in nom:
+        if "montant" in nom.lower():
             return '#,##0.00 "€"'
-        if nom == "gestes_par_contrat":
+        if nom == "operations_par_compte":
             return "0.00"
         return "#,##0"
+
+    def valeur(v):
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return None
+        return v.item() if hasattr(v, "item") else v
 
     def ecrire_tableau(ws, df, ligne, titre=None):
         if titre:
@@ -286,87 +266,73 @@ def ecrire_excel(tab, sortie):
         debut = ligne + 1
         for i, rang in enumerate(df.itertuples(index=False), debut):
             for j, (c, v) in enumerate(zip(df.columns, rang), 1):
-                v = None if (isinstance(v, float) and pd.isna(v)) else v
-                cell = ws.cell(row=i, column=j, value=v)
+                cell = ws.cell(row=i, column=j, value=valeur(v))
                 cell.border = bord
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    cell.number_format = format_col(c)
+                if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                    cell.number_format = format_col(str(c))
         return debut, debut + len(df) - 1
 
-    def finaliser(ws, largeur_min=12):
+    def largeurs(ws):
         for col in ws.columns:
-            taille = max(len(str(c.value)) if c.value is not None else 0 for c in col)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(largeur_min, taille + 2), 45)
+            taille = max(len(str(c.value)) if c.value is not None else 0 for c in col[2:] or col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(12, taille + 2), 45)
+
+    def graphe_barres(ws, titre, col_val, d, f, ancre):
+        g = BarChart()
+        g.title = titre
+        g.add_data(Reference(ws, min_col=col_val, min_row=d - 1, max_row=f), titles_from_data=True)
+        g.set_categories(Reference(ws, min_col=1, min_row=d, max_row=f))
+        g.legend, g.height, g.width = None, 9, 20
+        ws.add_chart(g, ancre)
 
     wb = Workbook()
     wb.remove(wb.active)
-    feuilles = ["Synthese", "Par_mois", "Distribution_montants", "Comptes_joints",
-                "Recurrence", "Jour_semaine", "Engagement", "Controles"]
-    for nom in feuilles:
-        if nom == "Distribution_montants":
-            if "Quantiles" not in tab:
-                continue
-        elif nom not in tab:
+    for nom in ["Synthese", "Par_mois", "Distribution_montants", "Comptes_joints",
+                "Recurrence", "Jour_semaine", "Engagement", "Controles"]:
+        if nom not in tab and not (nom == "Distribution_montants" and "Quantiles" in tab):
             continue
         ws = wb.create_sheet(nom)
         ws.cell(row=1, column=1, value=TITRES[nom]).font = Font(bold=True, size=14, color=bleu)
-        ws.cell(row=2, column=1, value="Généré le {}".format(dt.date.today().strftime("%d/%m/%Y"))).font = Font(italic=True, color="808080")
+        ws.cell(row=2, column=1, value="Généré le {:%d/%m/%Y}".format(dt.date.today())).font = Font(italic=True, color="808080")
 
         if nom == "Synthese":
             d, f = ecrire_tableau(ws, tab[nom], 4)
             for r in range(d, f + 1):
-                lib = ws.cell(row=r, column=1).value
                 v = ws.cell(row=r, column=2)
                 if isinstance(v.value, (int, float)):
-                    v.number_format = '#,##0.00 "€"' if "€" in lib else "#,##0"
+                    v.number_format = '#,##0.00 "€"' if "€" in ws.cell(row=r, column=1).value else "#,##0"
         elif nom == "Distribution_montants":
             d1, f1 = ecrire_tableau(ws, tab["Quantiles"], 4, "Quantiles des montants")
             d2, f2 = ecrire_tableau(ws, tab["Tranches"], f1 + 3, "Répartition par tranche de montant")
-            graph = BarChart()
-            graph.title, graph.y_axis.title = "Nombre de gestes par tranche", "Nb gestes"
-            graph.add_data(Reference(ws, min_col=2, min_row=d2 - 1, max_row=f2), titles_from_data=True)
-            graph.set_categories(Reference(ws, min_col=1, min_row=d2, max_row=f2))
-            graph.legend, graph.height, graph.width = None, 8, 18
-            ws.add_chart(graph, "H4")
+            graphe_barres(ws, "Nombre d'opérations par tranche de montant", 2, d2, f2, "I4")
         else:
             d, f = ecrire_tableau(ws, tab[nom], 4)
-            if nom == "Par_mois" and f >= d:
-                graph = LineChart()
-                graph.title, graph.y_axis.title = "Nombre de gestes co par mois", "Nb gestes"
-                graph.add_data(Reference(ws, min_col=2, min_row=d - 1, max_row=f), titles_from_data=True)
-                graph.add_data(Reference(ws, min_col=4, min_row=d - 1, max_row=f), titles_from_data=True)
-                graph.set_categories(Reference(ws, min_col=1, min_row=d, max_row=f))
-                graph.height, graph.width = 9, 22
-                ws.add_chart(graph, "B{}".format(f + 3))
-        ws.freeze_panes = "A5" if nom != "Distribution_montants" else None
-        finaliser(ws)
+            if nom == "Par_mois" and f > d:
+                for c in ws[f]:
+                    c.font = Font(bold=True)          # ligne Total période
+                graphe_barres(ws, "Comptes bénéficiaires par mois", 2, d, f - 1, "D4")
+            ws.freeze_panes = "A5"
+        largeurs(ws)
 
     ws = wb.create_sheet("Definitions")
-    notes = [
-        ("Geste co", "Une ligne du dataset après conservation de la personne de rang 1 (la plus engagée)."),
-        ("Bénéficiaire principal", "Personne de rang 1 sur le contrat au moment du geste."),
-        ("Tous titulaires", "Toutes les personnes rattachées au contrat, quel que soit leur rang."),
-        ("Compte joint", "Contrat rattaché à au moins 2 personnes distinctes dans le dataset."),
-        ("Mois", "Mois de la date d'événement ({}).".format(COL_DATE)),
-        ("Médiane / quantiles", "Calculés de façon approchée par Spark (précision 0,01 %)."),
-    ]
     ws.cell(row=1, column=1, value="Définitions").font = Font(bold=True, size=14, color=bleu)
-    ecrire_tableau(ws, pd.DataFrame(notes, columns=["Terme", "Définition"]), 3)
-    ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 25, 90
+    ecrire_tableau(ws, pd.DataFrame([
+        ("Compte bénéficiaire", "RIB distinct ({}) ayant reçu au moins un geste co.".format(COL_RIB)),
+        ("Opération", "Un geste co : une ligne après conservation de la personne de rang 1."),
+        ("Bénéficiaire principal", "Personne de rang 1 sur le compte (la plus engagée)."),
+        ("Compte joint", "RIB rattaché à au moins 2 personnes distinctes dans le fichier."),
+        ("Mois", "Mois de la date d'événement ({}).".format(COL_DATE)),
+        ("Total période", "RIB distincts sur toute la période : un compte aidé plusieurs mois n'est compté qu'une fois."),
+    ], columns=["Terme", "Définition"]), 3)
+    ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 25, 95
 
     wb.save(sortie)
 
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# ============================== EXÉCUTION DANS DATAIKU =======================
-if dataiku is not None:
-    sc = SparkContext.getOrCreate()
-    sqlContext = SQLContext(sc)
 
-    gestes = dkuspark.get_dataframe(sqlContext, dataiku.Dataset(DATASET_ENTREE))
-    tableaux = calculer_tableaux(gestes)
-
-    tampon = io.BytesIO()
-    ecrire_excel(tableaux, tampon)
-    with dataiku.Folder(DOSSIER_SORTIE).get_writer(NOM_FICHIER) as w:
-        w.write(tampon.getvalue())
-    print("Rapport écrit :", NOM_FICHIER)
+# ============================== EXÉCUTION ====================================
+if __name__ == "__main__":
+    entree = sys.argv[1] if len(sys.argv) > 1 else FICHIER_ENTREE
+    sortie = sys.argv[2] if len(sys.argv) > 2 else FICHIER_SORTIE
+    donnees = lire(entree)
+    ecrire_excel(calculer_tableaux(donnees), sortie)
+    print("Rapport écrit :", sortie)
