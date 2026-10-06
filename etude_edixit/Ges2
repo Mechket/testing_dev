@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+"""
+Metriques descriptives des gestes co.
+
+Entree : dataset benef_gestes_co (1 ligne par geste, sortie de la recette gestes co)
+Sortie : dossier gere Dataiku "metriques_gestes_co" -> metriques_gestes_co.xlsx (1 onglet par tableau)
+"""
+import io
+
+import dataiku
+import pandas as pd
+import pyspark.sql.functions as F
+from dataiku import spark as dkuspark
+from openpyxl.styles import Font
+from pyspark import SparkContext
+from pyspark.sql import SQLContext, SparkSession
+
+sparkSession = (SparkSession
+                .builder.appName("gestes_co_metriques")
+                .master("yarn-client")
+                .config("spark.driver.memory", "2g")
+                .config("spark.executor.memory", "2g")
+                .config("spark.executor.instances", 5)
+                .enableHiveSupport()
+                .getOrCreate())
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# =============================================================================
+# Parametres
+# =============================================================================
+COL_MONTANT = "MNT_OPE"          # <- nom de la colonne montant dans gestes_commerciaux, A ADAPTER
+DOSSIER_SORTIE = "metriques_gestes_co"
+FICHIER = "metriques_gestes_co.xlsx"
+QUANTILES = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+TRANCHES = [0, 10, 20, 50, 100, 200, 500]   # bornes des tranches de montant (euros)
+
+FLAGS = ["TOP_Patrimoniaux", "TOP_Adultes_a_enjeux", "TOP_Jeunes", "TOP_MULTI_EQP",
+         "TOP_ELIG_DIRECT",
+         "TOP_LIEN_AVEC_Patrimoniaux", "TOP_LIEN_AVEC_Adultes_a_enjeux",
+         "TOP_LIEN_AVEC_Jeunes", "TOP_LIEN_AVEC_MULTI_EQP", "TOP_LIEN_ELIGIBLE",
+         "TOP_ELIGIBLE"]
+
+df = dkuspark.get_dataframe(sqlContext, dataiku.Dataset("benef_gestes_co"))
+df = (df.withColumn("montant",
+                    F.regexp_replace(F.col(COL_MONTANT).cast("string"), ",", ".").cast("double"))
+        .cache())
+NB_GESTES = df.count()
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def agg_base():
+    return [F.count("*").alias("nb_gestes"),
+            F.countDistinct("num_cnt_ben").alias("nb_contrats"),
+            F.countDistinct("id_prs").alias("nb_clients"),
+            F.round(F.sum("montant"), 2).alias("montant_total"),
+            F.round(F.avg("montant"), 2).alias("montant_moyen"),
+            F.expr("percentile_approx(montant, 0.5)").alias("montant_median")]
+
+
+def ajouter_pct(pdf, col="nb_gestes"):
+    pdf["pct_" + col] = (100.0 * pdf[col] / pdf[col].sum()).round(1)
+    return pdf
+
+
+def par(*cols):
+    """Volumes + montants par modalite(s), avec % du total des gestes."""
+    return ajouter_pct(df.groupBy(*cols).agg(*agg_base()).orderBy(*cols).toPandas())
+
+
+def croise(ligne, colonne):
+    """Tableau croise (nb de gestes) ligne x colonne."""
+    return (df.groupBy(ligne).pivot(colonne).count()
+              .orderBy(ligne).toPandas().fillna(0))
+
+
+def tranche_montant(col):
+    expr = F.when(F.col(col).isNull(), "Montant manquant").when(F.col(col) < 0, "Negatif")
+    for i, (a, b) in enumerate(zip(TRANCHES[:-1], TRANCHES[1:]), start=1):
+        expr = expr.when(F.col(col) < b, "{:02d}. [{:g} ; {:g}[".format(i, a, b))
+    return expr.otherwise("{:02d}. {:g} et +".format(len(TRANCHES), TRANCHES[-1]))
+
+
+tables = {}
+
+# =============================================================================
+# 1. Synthese
+# =============================================================================
+synth = df.agg(
+    *agg_base(),
+    F.sum((F.col("type_compte") == "Individuel").cast("int")).alias("nb_gestes_cpt_individuels"),
+    F.sum((F.col("type_compte") == "Joint").cast("int")).alias("nb_gestes_cpt_joints"),
+    F.sum((F.col("type_compte") == "Contrat non retrouve").cast("int")).alias("nb_gestes_contrat_non_retrouve"),
+    F.countDistinct(F.when(F.col("type_compte") == "Individuel", F.col("num_cnt_ben"))).alias("nb_cpt_individuels_distincts"),
+    F.countDistinct(F.when(F.col("type_compte") == "Joint", F.col("num_cnt_ben"))).alias("nb_cpt_joints_distincts"),
+    F.sum("TOP_ELIGIBLE").alias("nb_gestes_eligibles"),
+    F.sum(F.col("montant").isNull().cast("int")).alias("nb_montants_manquants"),
+).toPandas()
+synth = synth.T.reset_index()
+synth.columns = ["indicateur", "valeur"]
+tables["Synthese"] = synth
+
+# =============================================================================
+# 2. Volumes dans le temps
+# =============================================================================
+tables["Par_mois"] = par("mois_geste")
+tables["Mois_x_type_compte"] = croise("mois_geste", "type_compte")
+tables["Mois_x_eligibilite"] = croise("mois_geste", "categorie_eligibilite")
+
+# =============================================================================
+# 3. Comptes individuels / joints
+# =============================================================================
+tables["Type_compte"] = par("type_compte")
+
+# =============================================================================
+# 4. Eligibilite
+# =============================================================================
+tables["Eligibilite_categorie"] = par("categorie_eligibilite")          # exclusive
+
+crit = df.agg(*[F.sum(c).alias(c) for c in FLAGS]).toPandas().T.reset_index()
+crit.columns = ["critere", "nb_gestes"]
+crit["pct_gestes"] = (100.0 * crit["nb_gestes"] / NB_GESTES).round(1)
+tables["Eligibilite_criteres"] = crit                                    # non exclusive
+
+tables["Type_cpt_x_eligibilite"] = par("type_compte", "categorie_eligibilite")
+tables["Segment_marche"] = par("cd_seg_com_marche_aff_av_fra")
+tables["Segment_engagement"] = par("cd_seg_com_engag_stb")
+
+# =============================================================================
+# 5. Distribution des montants
+# =============================================================================
+q = df.select(F.expr("percentile_approx(montant, array({}))".format(
+    ", ".join(str(x) for x in QUANTILES)))).first()[0]
+d = df.agg(F.count("montant").alias("n"), F.min("montant").alias("min"),
+           F.max("montant").alias("max"), F.avg("montant").alias("moyenne"),
+           F.stddev("montant").alias("ecart_type"), F.sum("montant").alias("somme")).first()
+dist = [("nb montants renseignes", d["n"]), ("somme", d["somme"]), ("moyenne", d["moyenne"]),
+        ("ecart-type", d["ecart_type"]), ("min", d["min"])]
+dist += [("P{:g}".format(100 * p), v) for p, v in zip(QUANTILES, q or [None] * len(QUANTILES))]
+dist += [("max", d["max"])]
+tables["Distribution_montant"] = pd.DataFrame(dist, columns=["statistique", "valeur"]).round(2)
+
+tables["Tranches_montant"] = par(tranche_montant("montant").alias("tranche_montant"))
+tables["Tranches_x_type_compte"] = (df.withColumn("tranche_montant", tranche_montant("montant"))
+                                      .groupBy("tranche_montant").pivot("type_compte").count()
+                                      .orderBy("tranche_montant").toPandas().fillna(0))
+
+# =============================================================================
+# 6. Recurrence : nombre de gestes par client
+# =============================================================================
+gpc = (df.filter(F.col("id_prs").isNotNull())
+         .groupBy("id_prs").agg(F.count("*").alias("n"), F.sum("montant").alias("mt"))
+         .withColumn("nb_gestes_client", F.when(F.col("n") >= 5, "5 et +").otherwise(F.col("n").cast("string")))
+         .groupBy("nb_gestes_client")
+         .agg(F.count("*").alias("nb_clients"), F.round(F.avg("mt"), 2).alias("montant_moyen_cumule"))
+         .orderBy("nb_gestes_client").toPandas())
+tables["Gestes_par_client"] = ajouter_pct(gpc, "nb_clients")
+
+# =============================================================================
+# 7. Presence dans le socle seg
+# =============================================================================
+tables["Presence_socle"] = par("TOP_PRESENT_SEG_202512", "TOP_PRESENT_SEG_202608")
+
+# =============================================================================
+# Export Excel dans le dossier gere
+# =============================================================================
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    for nom, t in tables.items():
+        onglet = nom[:31]
+        t.to_excel(xw, sheet_name=onglet, index=False)
+        ws = xw.sheets[onglet]
+        ws.freeze_panes = "A2"
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for cells in ws.columns:
+            largeur = max(len(str(c.value)) if c.value is not None else 0 for c in cells)
+            ws.column_dimensions[cells[0].column_letter].width = min(45, largeur + 2)
+buf.seek(0)
+dataiku.Folder(DOSSIER_SORTIE).upload_stream(FICHIER, buf)
+print("Export OK :", FICHIER, "-", len(tables), "onglets,", NB_GESTES, "gestes")
