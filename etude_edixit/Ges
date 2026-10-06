@@ -1,338 +1,222 @@
 # -*- coding: utf-8 -*-
-# ==============================================================================
-# Étude descriptive des bénéficiaires de gestes co — Python (pandas + openpyxl)
-#
-# Entrée  : un fichier CSV ou Excel avec les colonnes
-#           men_div_ope, dt_cre_evt, num_cnt_ben, id_prs, rank, mnt_ope
-# Sortie  : un fichier Excel avec les tableaux descriptifs
-#
-# Utilisation : python descriptif_gestes_co.py  (après avoir réglé les paramètres)
-#          ou   python descriptif_gestes_co.py mon_fichier.csv
-# ==============================================================================
-import re
-import sys
-import datetime as dt
+"""
+Recette gestes co : rattachement des gestes aux personnes, choix d'une personne par geste,
+indicateurs d'eligibilite.
 
-import pandas as pd
+Sorties :
+- benef_gestes_co        : 1 ligne par geste (personne retenue), SANS filtre -> entree du script de metriques
+- cli_gestes_co          : id_prs distincts ayant eu au moins un geste
+- benef_gestes_co_janv26 : id_prs distincts ayant eu un geste en janvier 2026
+                           ET presents dans le socle seg en 12/2025 ET en 08/2026
 
-# ============================== PARAMÈTRES À ADAPTER ==========================
-FICHIER_ENTREE = "gestes_co.csv"          # .csv, .xlsx ou .xls
-SEPARATEUR_CSV = ";"                      # séparateur si CSV
-FICHIER_SORTIE = "descriptif_gestes_co_{}.xlsx".format(dt.date.today().strftime("%Y%m%d"))
+Regle de choix de la personne (comptes joints) :
+  1 personne derriere le contrat -> cette personne
+  sinon -> la personne eligible (critere direct OU lien familial eligible)
+  si plusieurs eligibles (ou aucune) -> la plus engagee (cd_seg_com_engag_stb le plus eleve)
+"""
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark import SparkContext
+from pyspark.sql import SQLContext, SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
 
-COL_RIB = "men_div_ope"     # RIB / IBAN (FR...) -> sert au comptage des comptes
-COL_DATE = "dt_cre_evt"     # date de l'événement (ex. 10JUN2026)
-COL_CNT = "num_cnt_ben"     # numéro de contrat (sous-chaîne du RIB)
-COL_PRS = "id_prs"          # id personne
-COL_RANK = "rank"           # 1 = personne la plus engagée du compte
-COL_MNT = "mnt_ope"         # montant du geste co
-COL_SEG = "cd_seg_com_engag_aff_M"  # segment d'engagement (onglet ignoré si absent)
+sparkSession = (SparkSession
+                .builder.appName("gestes_co")
+                .master("yarn-client")
+                .config("spark.driver.maxResultSize", "2g")
+                .config("spark.driver.memory", "2g")
+                .config("spark.executor.memory", "2g")
+                .config("spark.executor.instances", 5)
+                .config("spark.sql.autoBroadcastJoinThreshold", -1)
+                .enableHiveSupport()
+                .getOrCreate())
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
 
-# Tranches de montant (en euros) : [0 ; 10[, [10 ; 20[, ..., 1000 et +
-BORNES_MONTANT = [0, 10, 20, 50, 100, 200, 500, 1000]
+# =============================================================================
+# Parametres
+# =============================================================================
+MOIS_DEB, MOIS_FIN = 202501, 202608
+MOIS_GESTE_CIBLE = 202601                 # gestes de janvier 2026
+MOIS_SOCLE_1, MOIS_SOCLE_2 = 202512, 202608  # presence requise dans le socle seg
+DATE_MAX_LIEN = "2026-08-31"
+TYPES_LIEN = ["D", "C"]                   # descendants / conjoints
 
-
-# ============================== LECTURE ======================================
-def lire(chemin):
-    if chemin.lower().endswith((".xlsx", ".xls", ".xlsm")):
-        df = pd.read_excel(chemin, dtype={COL_RIB: str, COL_CNT: str, COL_PRS: str})
-    else:
-        df = pd.read_csv(chemin, sep=SEPARATEUR_CSV, dtype={COL_RIB: str, COL_CNT: str, COL_PRS: str},
-                         encoding="utf-8-sig", decimal=",")
-    manquantes = [c for c in [COL_RIB, COL_DATE, COL_CNT, COL_PRS, COL_RANK, COL_MNT] if c not in df.columns]
-    if manquantes:
-        raise ValueError("Colonnes absentes du fichier : {}\nColonnes trouvées : {}".format(manquantes, list(df.columns)))
-    return df
-
-
-# ============================== PRÉPARATION ==================================
-MOIS = {"jan": 1, "feb": 2, "fev": 2, "mar": 3, "apr": 4, "avr": 4, "may": 5, "mai": 5,
-        "jun": 6, "jul": 7, "aug": 8, "aou": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
-REGEX_DATE = re.compile(r"^\s*(\d{1,2})[\s\-/\.]*([A-Za-zéÉûÛ]+)\.?[\s\-/\.]*(\d{2,4})")
+FLAGS = ["TOP_Patrimoniaux", "TOP_Adultes_a_enjeux", "TOP_Jeunes", "TOP_MULTI_EQP"]
+LIEN_FLAGS = ["TOP_LIEN_AVEC_" + c[4:] for c in FLAGS] + ["TOP_LIEN_ELIGIBLE"]
 
 
-def lire_une_date(v):
-    """'10JUN2026', '10 jun 2026', '10-JUN-26', '10 juin 2026' -> date. Sinon tentative standard."""
-    if pd.isna(v):
-        return pd.NaT
-    if isinstance(v, (dt.date, dt.datetime, pd.Timestamp)):
-        return pd.Timestamp(v)
-    s = str(v).strip()
-    m = REGEX_DATE.match(s)
-    if m:
-        jour, lib, annee = m.groups()
-        lib = lib.lower().replace("é", "e").replace("û", "u")
-        mois = 7 if lib.startswith("juil") else 6 if lib.startswith("juin") else MOIS.get(lib[:3])
-        if mois:
-            annee = int(annee) + 2000 if len(annee) == 2 else int(annee)
-            try:
-                return pd.Timestamp(year=annee, month=mois, day=int(jour))
-            except ValueError:
-                return pd.NaT
-    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+def lire(nom):
+    return dkuspark.get_dataframe(sqlContext, dataiku.Dataset(nom))
 
 
-def tranche_montant(x):
-    if pd.isna(x):
-        return "Montant manquant"
-    if x < 0:
-        return "Négatif"
-    for i in range(len(BORNES_MONTANT) - 1):
-        if x < BORNES_MONTANT[i + 1]:
-            return "{:02d}. [{} ; {}[".format(i + 1, BORNES_MONTANT[i], BORNES_MONTANT[i + 1])
-    return "{:02d}. {} et +".format(len(BORNES_MONTANT), BORNES_MONTANT[-1])
+gestes_src = lire("gestes_commerciaux")
+contrat_src = lire("bloc_contrat_cur_ext")
+seg_src = lire("bloc_seg_cur_ext")
+liens_src = lire("lbp_al42_repr_pph_active_q")
+
+# =============================================================================
+# 1. Gestes : identifiant technique, numero de contrat, mois du geste
+# =============================================================================
+gestes = (
+    gestes_src
+    .withColumn("id_geste", F.monotonically_increasing_id())
+    .withColumn(
+        "num_cnt_ben",
+        F.when(F.col("MEN_DIV_OPE").rlike(r"\d{3,5}$"),
+               F.regexp_extract("MEN_DIV_OPE", r"\d{7}[A-Z]\d{3}", 0))
+         .when(F.col("MEN_DIV_OPE").rlike(r"[A-Z]\d{0,2}$"),
+               F.regexp_extract("MEN_DIV_OPE", r"\d{10}[A-Z]", 0)))
+    # regexp_extract renvoie "" quand rien ne matche -> on remet a null
+    .withColumn("num_cnt_ben", F.when(F.col("num_cnt_ben") != "", F.col("num_cnt_ben")))
+    .withColumn("dt_geste", F.to_date(F.col("DT_CRE_EVT"), "ddMMMyyyy"))
+    .withColumn("mois_geste", F.date_format("dt_geste", "yyyyMM").cast("int"))
+    # le segment est lu sur le mois precedant le geste
+    .withColumn("mois_seg_ref", F.date_format(F.add_months("dt_geste", -1), "yyyyMM").cast("int"))
+)
+
+# =============================================================================
+# 2. Contrat -> personne(s) : derniere photo du contrat sur la periode
+# =============================================================================
+w_ctr = Window.partitionBy("num_cnt_com")
+contrat = (
+    contrat_src
+    .filter(F.col("annee_mois_part").between(MOIS_DEB, MOIS_FIN))
+    .select("num_cnt_com", "id_prs", "annee_mois_part").distinct()
+    .withColumn("max_amp", F.max("annee_mois_part").over(w_ctr))
+    .filter(F.col("annee_mois_part") == F.col("max_amp"))
+    .select("num_cnt_com", "id_prs").distinct()
+    .withColumn("nb_prs_contrat", F.count("id_prs").over(w_ctr))
+)
+
+# =============================================================================
+# 3. Socle seg + criteres d'eligibilite directs (1 ligne par personne et par mois)
+# =============================================================================
+seg = (
+    seg_src
+    .filter(F.col("annee_mois_part").between(MOIS_DEB, MOIS_FIN))
+    .select(F.col("id_prs").alias("id_prs_seg"),
+            F.col("annee_mois_part").cast("int").alias("mois_seg"),
+            F.col("cd_seg_com_engag_stb").cast("int").alias("cd_seg_com_engag_stb"),
+            F.col("cd_seg_com_marche_aff_av_fra"))
+    .dropDuplicates(["id_prs_seg", "mois_seg"])
+    .withColumn("TOP_Patrimoniaux", (F.col("cd_seg_com_marche_aff_av_fra") == "A").cast("int"))
+    .withColumn("TOP_Adultes_a_enjeux", (F.col("cd_seg_com_marche_aff_av_fra") == "B").cast("int"))
+    .withColumn("TOP_Jeunes", F.col("cd_seg_com_marche_aff_av_fra").isin("D", "E").cast("int"))
+    .withColumn("TOP_MULTI_EQP", (F.col("cd_seg_com_engag_stb") == 5).cast("int"))
+    .fillna(0, subset=FLAGS)
+    .withColumn("TOP_ELIG_DIRECT", F.greatest(*FLAGS))
+    .cache()
+)
+
+# =============================================================================
+# 4. Gestes x personnes x segment du mois precedent
+# =============================================================================
+benef = (
+    gestes
+    .join(contrat, gestes.num_cnt_ben == contrat.num_cnt_com, "left")
+    .join(seg, (F.col("id_prs") == F.col("id_prs_seg"))
+               & (F.col("mois_seg_ref") == F.col("mois_seg")), "left")
+    .withColumn("TOP_PRESENT_SEG_REF", F.col("id_prs_seg").isNotNull().cast("int"))
+    .drop("id_prs_seg", "mois_seg")
+)
+
+# =============================================================================
+# 5. Eligibilite via un lien familial (conjoint / enfant eligible)
+#    Agregee a 1 ligne par (personne, mois) AVANT le choix de la personne,
+#    pour ne pas dupliquer les gestes quand une personne a plusieurs liens.
+# =============================================================================
+liens = (
+    liens_src
+    .filter(F.col("type_lien_partenaires").isin(TYPES_LIEN)
+            & (F.to_date("date_de_creation") <= F.lit(DATE_MAX_LIEN)))
+    .select(F.col("identifiant_partenaire").alias("id_prs"),
+            F.col("identifiant_partenaire_lie").alias("id_prs_lie"))
+    .distinct()
+)
+
+seg_lie = seg.select(F.col("id_prs_seg").alias("id_prs_lie"),
+                     F.col("mois_seg").alias("mois_seg_ref"),
+                     *[F.col(c).alias(c + "_lie") for c in FLAGS + ["TOP_ELIG_DIRECT"]])
+
+elig_lien = (
+    benef.select("id_prs", "mois_seg_ref").dropna().distinct()
+    .join(liens, "id_prs")
+    .join(seg_lie, ["id_prs_lie", "mois_seg_ref"])
+    .groupBy("id_prs", "mois_seg_ref")
+    .agg(*[F.max(c + "_lie").alias("TOP_LIEN_AVEC_" + c[4:]) for c in FLAGS],
+         F.max("TOP_ELIG_DIRECT_lie").alias("TOP_LIEN_ELIGIBLE"))
+)
+
+benef = (
+    benef.join(elig_lien, ["id_prs", "mois_seg_ref"], "left")
+    .fillna(0, subset=FLAGS + ["TOP_ELIG_DIRECT"] + LIEN_FLAGS)
+    .withColumn("TOP_ELIGIBLE", F.greatest("TOP_ELIG_DIRECT", "TOP_LIEN_ELIGIBLE"))
+)
+
+# =============================================================================
+# 6. Choix d'une personne par geste
+# =============================================================================
+w_geste = Window.partitionBy("id_geste").orderBy(
+    F.col("TOP_ELIGIBLE").desc(),                    # la personne eligible d'abord
+    F.col("cd_seg_com_engag_stb").desc_nulls_last(), # puis la plus engagee
+    F.col("TOP_ELIG_DIRECT").desc(),                 # departage : eligible en direct
+    F.col("id_prs").asc_nulls_last())                # departage deterministe
+
+benef = (
+    benef
+    .withColumn("rang", F.row_number().over(w_geste))
+    .filter(F.col("rang") == 1).drop("rang")
+    .withColumn("type_compte",
+                F.when(F.col("nb_prs_contrat") == 1, "Individuel")
+                 .when(F.col("nb_prs_contrat") >= 2, "Joint")
+                 .otherwise("Contrat non retrouve"))
+    # categorie exclusive (hierarchie a ajuster si besoin)
+    .withColumn("categorie_eligibilite",
+                F.when(F.col("id_prs").isNull(), "Contrat non retrouve")
+                 .when(F.col("TOP_Patrimoniaux") == 1, "Patrimonial")
+                 .when(F.col("TOP_Adultes_a_enjeux") == 1, "Adulte a enjeux")
+                 .when(F.col("TOP_MULTI_EQP") == 1, "Multi-equipe")
+                 .when(F.col("TOP_Jeunes") == 1, "Jeune")
+                 .when(F.col("TOP_LIEN_ELIGIBLE") == 1, "Lien familial eligible")
+                 .otherwise("Non eligible"))
+)
+
+# =============================================================================
+# 7. Presence dans le socle seg en 12/2025 et 08/2026
+# =============================================================================
+def presents(mois, nom_col):
+    return (seg.filter(F.col("mois_seg") == mois)
+               .select(F.col("id_prs_seg").alias("id_prs")).distinct()
+               .withColumn(nom_col, F.lit(1)))
 
 
-def preparer(df):
-    df = df.copy()
-    for c in (COL_RIB, COL_CNT, COL_PRS):
-        df[c] = df[c].astype("string").str.strip().replace("", pd.NA)
-    df["date_evt"] = df[COL_DATE].map(lire_une_date)
-    df["mois_evt"] = df["date_evt"].dt.strftime("%Y-%m")
-    if df[COL_MNT].dtype == object:
-        df[COL_MNT] = df[COL_MNT].astype(str).str.replace(" ", "").str.replace(",", ".")
-    df[COL_MNT] = pd.to_numeric(df[COL_MNT], errors="coerce")
-    df[COL_RANK] = pd.to_numeric(df[COL_RANK], errors="coerce")
-    df["tranche_mnt"] = df[COL_MNT].map(tranche_montant)
+benef = (
+    benef
+    .join(presents(MOIS_SOCLE_1, "TOP_PRESENT_SEG_202512"), "id_prs", "left")
+    .join(presents(MOIS_SOCLE_2, "TOP_PRESENT_SEG_202608"), "id_prs", "left")
+    .fillna(0, subset=["TOP_PRESENT_SEG_202512", "TOP_PRESENT_SEG_202608"])
+)
 
-    # Nombre de personnes distinctes par RIB -> compte joint / individuel
-    df["nb_titulaires"] = df.groupby(COL_RIB, dropna=False)[COL_PRS].transform("nunique")
-    df["type_compte"] = pd.cut(df["nb_titulaires"], [-1, 0, 1, 2, float("inf")],
-                               labels=["Sans personne rattachée", "Individuel",
-                                       "Joint (2 titulaires)", "Joint (3 titulaires et +)"]).astype(str)
-    return df
+# =============================================================================
+# 8. Sorties
+# =============================================================================
+cli_gestes_co_df = benef.filter(F.col("id_prs").isNotNull()).select("id_prs").distinct()
 
+cli_gestes_co_janv26_df = (
+    benef.filter((F.col("mois_geste") == MOIS_GESTE_CIBLE)
+                 & (F.col("TOP_PRESENT_SEG_202512") == 1)
+                 & (F.col("TOP_PRESENT_SEG_202608") == 1))
+    .select("id_prs").distinct()
+)
 
-def evenements(df):
-    """Une ligne par geste co : la personne de rang 1 (la plus engagée).
-    Les comptes sans personne rattachée sont gardés. Ex aequo au rang 1 -> une seule ligne."""
-    ev = df[(df[COL_RANK] == 1) | df[COL_PRS].isna()]
-    ev = ev.sort_values(COL_PRS, na_position="last")
-    return ev.drop_duplicates(subset=[COL_RIB, COL_CNT, COL_DATE, COL_MNT], keep="first")
+# Controle rapide dans les logs : dates non parsees / contrats non extraits
+ctrl = gestes.agg(F.count("*").alias("nb_gestes"),
+                  F.sum(F.col("dt_geste").isNull().cast("int")).alias("nb_dates_non_parsees"),
+                  F.sum(F.col("num_cnt_ben").isNull().cast("int")).alias("nb_contrats_non_extraits")).first()
+print("CONTROLE GESTES :", ctrl.asDict())
 
-
-def stats_montant(g):
-    return g.agg(montant_total=(COL_MNT, "sum"), montant_moyen=(COL_MNT, "mean"),
-                 montant_median=(COL_MNT, "median"))
-
-
-# ============================== INDICATEURS ==================================
-def calculer_tableaux(brut):
-    df = preparer(brut)
-    ev = evenements(df)
-    tab = {}
-
-    # --- Synthèse ---
-    comptes = df.drop_duplicates(COL_RIB)[[COL_RIB, "type_compte"]]
-    m = ev[COL_MNT]
-    tab["Synthese"] = pd.DataFrame([
-        ("Période couverte", "{:%d/%m/%Y} au {:%d/%m/%Y}".format(ev["date_evt"].min(), ev["date_evt"].max())
-         if ev["date_evt"].notna().any() else "Dates non lues"),
-        ("Nombre de comptes bénéficiaires (RIB distincts)", comptes[COL_RIB].nunique()),
-        ("  dont comptes individuels", int((comptes["type_compte"] == "Individuel").sum())),
-        ("  dont comptes joints", int(comptes["type_compte"].str.startswith("Joint").sum())),
-        ("Nombre d'opérations de geste co", len(ev)),
-        ("Nombre de bénéficiaires principaux (rang 1)", ev[COL_PRS].nunique()),
-        ("Nombre de personnes concernées (tous titulaires)", df[COL_PRS].nunique()),
-        ("Montant total (€)", m.sum()),
-        ("Montant moyen (€)", m.mean()),
-        ("Montant médian (€)", m.median()),
-        ("Montant minimum (€)", m.min()),
-        ("Montant maximum (€)", m.max()),
-    ], columns=["Indicateur", "Valeur"])
-
-    # --- Par mois : comptes bénéficiaires (RIB distincts) ---
-    par_mois = (ev.assign(mois_evt=ev["mois_evt"].fillna("Date non lue"))
-                  .groupby("mois_evt")[COL_RIB].nunique().rename("nb_comptes").reset_index()
-                  .sort_values("mois_evt"))
-    total = pd.DataFrame([{"mois_evt": "Total période", "nb_comptes": ev[COL_RIB].nunique()}])
-    tab["Par_mois"] = pd.concat([par_mois, total], ignore_index=True)
-
-    # --- Distribution des montants ---
-    niveaux = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
-    tab["Quantiles"] = pd.DataFrame({"Quantile": ["P{}".format(int(round(q * 100))) for q in niveaux],
-                                     "Montant (€)": m.quantile(niveaux).values})
-    tranches = (ev.groupby("tranche_mnt").agg(nb_operations=(COL_MNT, "size"), nb_comptes=(COL_RIB, "nunique"),
-                                              montant_total=(COL_MNT, "sum"))
-                  .reset_index().sort_values("tranche_mnt"))
-    tranches["part_operations"] = tranches["nb_operations"] / tranches["nb_operations"].sum()
-    tranches["part_montant"] = tranches["montant_total"] / tranches["montant_total"].sum()
-    tab["Tranches"] = tranches.rename(columns={"tranche_mnt": "tranche_montant"})
-
-    # --- Comptes joints vs individuels ---
-    g = ev.groupby("type_compte")
-    joints = g.agg(nb_comptes=(COL_RIB, "nunique"), nb_operations=(COL_MNT, "size")).join(stats_montant(g)).reset_index()
-    joints["part_comptes"] = joints["nb_comptes"] / joints["nb_comptes"].sum()
-    joints["operations_par_compte"] = joints["nb_operations"] / joints["nb_comptes"]
-    tab["Comptes_joints"] = joints[["type_compte", "nb_comptes", "part_comptes", "nb_operations",
-                                    "operations_par_compte", "montant_total", "montant_moyen", "montant_median"]]
-
-    # --- Récurrence : nombre de gestes co par compte ---
-    par_rib = ev.groupby(COL_RIB).agg(n=(COL_MNT, "size"), mnt=(COL_MNT, "sum"))
-    par_rib["nb_operations_par_compte"] = par_rib["n"].map(lambda n: "5 et +" if n >= 5 else str(n))
-    recur = (par_rib.groupby("nb_operations_par_compte")
-                    .agg(nb_comptes=("n", "size"), montant_cumule_moyen=("mnt", "mean")).reset_index())
-    recur["part_comptes"] = recur["nb_comptes"] / recur["nb_comptes"].sum()
-    tab["Recurrence"] = recur[["nb_operations_par_compte", "nb_comptes", "part_comptes", "montant_cumule_moyen"]]
-
-    # --- Jour de la semaine ---
-    noms = ["1. Lundi", "2. Mardi", "3. Mercredi", "4. Jeudi", "5. Vendredi", "6. Samedi", "7. Dimanche"]
-    e = ev[ev["date_evt"].notna()]
-    jours = (e.assign(jour=e["date_evt"].dt.dayofweek.map(dict(enumerate(noms))))
-              .groupby("jour").agg(nb_comptes=(COL_RIB, "nunique"), nb_operations=(COL_MNT, "size")).reset_index())
-    jours["part_operations"] = jours["nb_operations"] / jours["nb_operations"].sum()
-    tab["Jour_semaine"] = jours
-
-    # --- Segment d'engagement du bénéficiaire principal ---
-    if COL_SEG in df.columns:
-        g = ev.groupby(COL_SEG)
-        seg = g.agg(nb_beneficiaires=(COL_PRS, "nunique"), nb_comptes=(COL_RIB, "nunique"),
-                    nb_operations=(COL_MNT, "size")).join(stats_montant(g)).reset_index()
-        seg["part_beneficiaires"] = seg["nb_beneficiaires"] / seg["nb_beneficiaires"].sum()
-        tab["Engagement"] = seg
-
-    # --- Contrôles qualité ---
-    rib_contient_cnt = [str(c) in str(r) for r, c in zip(ev[COL_RIB], ev[COL_CNT])]
-    ctrl = [
-        ("Lignes du fichier (toutes personnes)", len(df)),
-        ("Lignes de rang 1", int((df[COL_RANK] == 1).sum())),
-        ("Opérations retenues (une ligne par geste)", len(ev)),
-        ("Lignes sans id personne", int(df[COL_PRS].isna().sum())),
-        ("Lignes sans RIB", int(df[COL_RIB].isna().sum())),
-        ("Dates non lues", int(ev["date_evt"].isna().sum())),
-        ("Montants manquants", int(m.isna().sum())),
-        ("Montants nuls ou négatifs", int((m <= 0).sum())),
-        ("Contrats absents du RIB", rib_contient_cnt.count(False)),
-        ("Comptes à 3 titulaires et +", df.loc[df["nb_titulaires"] >= 3, COL_RIB].nunique()),
-    ]
-    exemples = ev.loc[ev["date_evt"].isna() & ev[COL_DATE].notna(), COL_DATE].astype(str).unique()[:5]
-    if len(exemples):
-        ctrl.append(("Exemples de dates non lues", " | ".join(exemples)))
-    tab["Controles"] = pd.DataFrame(ctrl, columns=["Contrôle", "Valeur"])
-    return tab
-
-
-# ============================== EXPORT EXCEL =================================
-LIBELLES = {
-    "mois_evt": "Mois", "nb_comptes": "Nb comptes bénéficiaires (RIB distincts)",
-    "nb_operations": "Nb opérations", "part_operations": "Part des opérations",
-    "nb_beneficiaires": "Nb bénéficiaires (rang 1)",
-    "montant_total": "Montant total (€)", "montant_moyen": "Montant moyen (€)", "montant_median": "Montant médian (€)",
-    "tranche_montant": "Tranche de montant", "part_montant": "Part du montant",
-    "type_compte": "Type de compte", "part_comptes": "Part des comptes", "operations_par_compte": "Opérations par compte",
-    "nb_operations_par_compte": "Nb gestes co par compte", "montant_cumule_moyen": "Montant cumulé moyen (€)",
-    "jour": "Jour", "part_beneficiaires": "Part des bénéficiaires", COL_SEG: "Segment d'engagement",
-}
-TITRES = {
-    "Synthese": "Synthèse des gestes co", "Par_mois": "Comptes bénéficiaires par mois",
-    "Distribution_montants": "Distribution des montants", "Comptes_joints": "Comptes joints vs individuels",
-    "Recurrence": "Nombre de gestes co par compte", "Jour_semaine": "Répartition par jour de la semaine",
-    "Engagement": "Bénéficiaires par segment d'engagement", "Controles": "Contrôles qualité des données",
-}
-
-
-def ecrire_excel(tab, sortie):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.chart import BarChart, Reference
-    from openpyxl.utils import get_column_letter
-
-    bleu, gris = "1F4E79", "D9D9D9"
-    entete = PatternFill("solid", fgColor=bleu)
-    bord = Border(bottom=Side(style="thin", color=gris))
-
-    def format_col(nom):
-        if nom.startswith(("part_", "Part")):
-            return "0.0%"
-        if "montant" in nom.lower():
-            return '#,##0.00 "€"'
-        if nom == "operations_par_compte":
-            return "0.00"
-        return "#,##0"
-
-    def valeur(v):
-        if v is None or (not isinstance(v, str) and pd.isna(v)):
-            return None
-        return v.item() if hasattr(v, "item") else v
-
-    def ecrire_tableau(ws, df, ligne, titre=None):
-        if titre:
-            ws.cell(row=ligne, column=1, value=titre).font = Font(bold=True, size=11, color=bleu)
-            ligne += 1
-        for j, c in enumerate(df.columns, 1):
-            cell = ws.cell(row=ligne, column=j, value=LIBELLES.get(c, c))
-            cell.fill, cell.font = entete, Font(bold=True, color="FFFFFF")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        debut = ligne + 1
-        for i, rang in enumerate(df.itertuples(index=False), debut):
-            for j, (c, v) in enumerate(zip(df.columns, rang), 1):
-                cell = ws.cell(row=i, column=j, value=valeur(v))
-                cell.border = bord
-                if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                    cell.number_format = format_col(str(c))
-        return debut, debut + len(df) - 1
-
-    def largeurs(ws):
-        for col in ws.columns:
-            taille = max(len(str(c.value)) if c.value is not None else 0 for c in col[2:] or col)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(12, taille + 2), 45)
-
-    def graphe_barres(ws, titre, col_val, d, f, ancre):
-        g = BarChart()
-        g.title = titre
-        g.add_data(Reference(ws, min_col=col_val, min_row=d - 1, max_row=f), titles_from_data=True)
-        g.set_categories(Reference(ws, min_col=1, min_row=d, max_row=f))
-        g.legend, g.height, g.width = None, 9, 20
-        ws.add_chart(g, ancre)
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    for nom in ["Synthese", "Par_mois", "Distribution_montants", "Comptes_joints",
-                "Recurrence", "Jour_semaine", "Engagement", "Controles"]:
-        if nom not in tab and not (nom == "Distribution_montants" and "Quantiles" in tab):
-            continue
-        ws = wb.create_sheet(nom)
-        ws.cell(row=1, column=1, value=TITRES[nom]).font = Font(bold=True, size=14, color=bleu)
-        ws.cell(row=2, column=1, value="Généré le {:%d/%m/%Y}".format(dt.date.today())).font = Font(italic=True, color="808080")
-
-        if nom == "Synthese":
-            d, f = ecrire_tableau(ws, tab[nom], 4)
-            for r in range(d, f + 1):
-                v = ws.cell(row=r, column=2)
-                if isinstance(v.value, (int, float)):
-                    v.number_format = '#,##0.00 "€"' if "€" in ws.cell(row=r, column=1).value else "#,##0"
-        elif nom == "Distribution_montants":
-            d1, f1 = ecrire_tableau(ws, tab["Quantiles"], 4, "Quantiles des montants")
-            d2, f2 = ecrire_tableau(ws, tab["Tranches"], f1 + 3, "Répartition par tranche de montant")
-            graphe_barres(ws, "Nombre d'opérations par tranche de montant", 2, d2, f2, "I4")
-        else:
-            d, f = ecrire_tableau(ws, tab[nom], 4)
-            if nom == "Par_mois" and f > d:
-                for c in ws[f]:
-                    c.font = Font(bold=True)          # ligne Total période
-                graphe_barres(ws, "Comptes bénéficiaires par mois", 2, d, f - 1, "D4")
-            ws.freeze_panes = "A5"
-        largeurs(ws)
-
-    ws = wb.create_sheet("Definitions")
-    ws.cell(row=1, column=1, value="Définitions").font = Font(bold=True, size=14, color=bleu)
-    ecrire_tableau(ws, pd.DataFrame([
-        ("Compte bénéficiaire", "RIB distinct ({}) ayant reçu au moins un geste co.".format(COL_RIB)),
-        ("Opération", "Un geste co : une ligne après conservation de la personne de rang 1."),
-        ("Bénéficiaire principal", "Personne de rang 1 sur le compte (la plus engagée)."),
-        ("Compte joint", "RIB rattaché à au moins 2 personnes distinctes dans le fichier."),
-        ("Mois", "Mois de la date d'événement ({}).".format(COL_DATE)),
-        ("Total période", "RIB distincts sur toute la période : un compte aidé plusieurs mois n'est compté qu'une fois."),
-    ], columns=["Terme", "Définition"]), 3)
-    ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 25, 95
-
-    wb.save(sortie)
-
-
-# ============================== EXÉCUTION ====================================
-if __name__ == "__main__":
-    entree = sys.argv[1] if len(sys.argv) > 1 else FICHIER_ENTREE
-    sortie = sys.argv[2] if len(sys.argv) > 2 else FICHIER_SORTIE
-    donnees = lire(entree)
-    ecrire_excel(calculer_tableaux(donnees), sortie)
-    print("Rapport écrit :", sortie)
+dkuspark.write_with_schema(dataiku.Dataset("benef_gestes_co"), benef)
+dkuspark.write_with_schema(dataiku.Dataset("cli_gestes_co"), cli_gestes_co_df)
+dkuspark.write_with_schema(dataiku.Dataset("benef_gestes_co_janv26"), cli_gestes_co_janv26_df)
