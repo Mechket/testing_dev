@@ -1,183 +1,455 @@
 # -*- coding: utf-8 -*-
 """
-Metriques descriptives des gestes co.
+Livrable Excel - metriques descriptives des gestes co (version locale, pandas).
 
-Entree : dataset benef_gestes_co (1 ligne par geste, sortie de la recette gestes co)
-Sortie : dossier gere Dataiku "metriques_gestes_co" -> metriques_gestes_co.xlsx (1 onglet par tableau)
+Entree : export du dataset Dataiku benef_gestes_co (1 ligne par geste), en CSV, Excel ou Parquet
+Sortie : metriques_gestes_co.xlsx (onglets mis en forme + graphiques)
+
+Installation : pip install pandas openpyxl        (+ pyarrow si l'input est en parquet)
+Lancement    : python gestes_co_livrable_excel.py
 """
-import io
+import csv
+from datetime import date
+from pathlib import Path
 
-import dataiku
+import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-from dataiku import spark as dkuspark
-from openpyxl.styles import Font
-from pyspark import SparkContext
-from pyspark.sql import SQLContext, SparkSession
-
-sparkSession = (SparkSession
-                .builder.appName("gestes_co_metriques")
-                .master("yarn-client")
-                .config("spark.driver.memory", "2g")
-                .config("spark.executor.memory", "2g")
-                .config("spark.executor.instances", 5)
-                .enableHiveSupport()
-                .getOrCreate())
-sc = SparkContext.getOrCreate()
-sqlContext = SQLContext(sc)
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 # =============================================================================
 # Parametres
 # =============================================================================
-COL_MONTANT = "MNT_OPE"          # <- nom de la colonne montant dans gestes_commerciaux, A ADAPTER
-DOSSIER_SORTIE = "metriques_gestes_co"
-FICHIER = "metriques_gestes_co.xlsx"
+FICHIER_ENTREE = "benef_gestes_co.csv"
+FICHIER_SORTIE = "metriques_gestes_co.xlsx"
+COL_MONTANT = "MNT_OPE"                      # <- nom de ta colonne montant, A ADAPTER
+TRANCHES = [0, 10, 20, 50, 100, 200, 500]    # bornes des tranches de montant (euros)
 QUANTILES = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
-TRANCHES = [0, 10, 20, 50, 100, 200, 500]   # bornes des tranches de montant (euros)
 
-FLAGS = ["TOP_Patrimoniaux", "TOP_Adultes_a_enjeux", "TOP_Jeunes", "TOP_MULTI_EQP",
-         "TOP_ELIG_DIRECT",
-         "TOP_LIEN_AVEC_Patrimoniaux", "TOP_LIEN_AVEC_Adultes_a_enjeux",
-         "TOP_LIEN_AVEC_Jeunes", "TOP_LIEN_AVEC_MULTI_EQP", "TOP_LIEN_ELIGIBLE",
-         "TOP_ELIGIBLE"]
+# Libelles propres pour le livrable
+LIB_TYPE = {"Individuel": "Individuel", "Joint": "Joint", "Contrat non retrouve": "Contrat non retrouvé"}
+ORDRE_TYPE = ["Individuel", "Joint", "Contrat non retrouvé"]
+LIB_CATEG = {"Patrimonial": "Patrimonial", "Adulte a enjeux": "Adulte à enjeux",
+             "Multi-equipe": "Multi-équipé", "Jeune": "Jeune",
+             "Lien familial eligible": "Lien familial éligible", "Non eligible": "Non éligible",
+             "Contrat non retrouve": "Contrat non retrouvé"}
+ORDRE_CATEG = list(LIB_CATEG.values())
+LIB_MARCHE = {"A": "A - Patrimoniaux", "B": "B - Adultes à enjeux", "D": "D - Jeunes", "E": "E - Jeunes"}
 
-df = dkuspark.get_dataframe(sqlContext, dataiku.Dataset("benef_gestes_co"))
-df = (df.withColumn("montant",
-                    F.regexp_replace(F.col(COL_MONTANT).cast("string"), ",", ".").cast("double"))
-        .cache())
-NB_GESTES = df.count()
+FLAGS = [  # (colonne, libelle, famille)
+    ("TOP_Patrimoniaux", "Patrimonial", "Direct"),
+    ("TOP_Adultes_a_enjeux", "Adulte à enjeux", "Direct"),
+    ("TOP_Jeunes", "Jeune", "Direct"),
+    ("TOP_MULTI_EQP", "Multi-équipé", "Direct"),
+    ("TOP_ELIG_DIRECT", "Au moins un critère direct", "Synthèse"),
+    ("TOP_LIEN_AVEC_Patrimoniaux", "Lien avec un patrimonial", "Lien familial"),
+    ("TOP_LIEN_AVEC_Adultes_a_enjeux", "Lien avec un adulte à enjeux", "Lien familial"),
+    ("TOP_LIEN_AVEC_Jeunes", "Lien avec un jeune", "Lien familial"),
+    ("TOP_LIEN_AVEC_MULTI_EQP", "Lien avec un multi-équipé", "Lien familial"),
+    ("TOP_LIEN_ELIGIBLE", "Au moins un lien éligible", "Synthèse"),
+    ("TOP_ELIGIBLE", "Éligible (direct ou lien)", "Synthèse"),
+]
+
+LIBELLES = {
+    "mois": "Mois du geste", "type_compte": "Type de compte",
+    "categorie_eligibilite": "Catégorie d'éligibilité", "segment_marche": "Segment marché",
+    "segment_engagement": "Segment engagement", "tranche_montant": "Tranche de montant",
+    "presence_12_2025": "Présent socle 12/2025", "presence_08_2026": "Présent socle 08/2026",
+    "nb_gestes": "Nb gestes", "pct_gestes": "% gestes", "nb_contrats": "Nb contrats",
+    "nb_clients": "Nb clients", "pct_clients": "% clients",
+    "montant_total": "Montant total", "montant_moyen": "Montant moyen", "montant_median": "Montant médian",
+    "nb_gestes_client": "Nb gestes par client", "montant_moyen_cumule": "Montant cumulé moyen / client",
+    "famille": "Famille", "critere": "Critère",
+}
+
+# =============================================================================
+# Styles
+# =============================================================================
+BLEU, BLEU_CLAIR, GRIS = "1F3864", "D9E1F2", "F2F2F2"
+FMT_INT, FMT_DEC, FMT_EUR, FMT_PCT = "#,##0", "#,##0.00", '#,##0.00 "€"', "0.0%"
+_fin = Side(style="thin", color="BFBFBF")
+BORD = Border(left=_fin, right=_fin, top=_fin, bottom=_fin)
+TITRES = set()  # cellules de titre, ignorees pour la largeur des colonnes
+
+
+def fmt_col(nom):
+    nom = str(nom)
+    if nom.startswith("pct"):
+        return FMT_PCT
+    if "montant" in nom:
+        return FMT_EUR
+    if nom.startswith("nb_"):
+        return FMT_INT
+    return None
+
+
+def valeur(v):
+    if isinstance(v, np.generic):
+        v = v.item()
+    if v is None or (isinstance(v, float) and np.isnan(v)) or v is pd.NA:
+        return None
+    return v
+
+
+def nouvelle_feuille(wb, nom, titre, sous_titre=""):
+    ws = wb.create_sheet(nom[:31])
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = titre
+    ws["A1"].font = Font(bold=True, size=14, color=BLEU)
+    ws["A2"] = sous_titre
+    ws["A2"].font = Font(italic=True, size=9, color="7F7F7F")
+    TITRES.update({(ws.title, "A1"), (ws.title, "A2")})
+    return ws
+
+
+def titre_section(ws, ligne, texte):
+    c = ws.cell(ligne, 1, texte)
+    c.font = Font(bold=True, size=11, color=BLEU)
+    TITRES.add((ws.title, c.coordinate))
+    return ligne + 1
+
+
+def entete(ws, ligne, colonnes):
+    for j, col in enumerate(colonnes, 1):
+        c = ws.cell(ligne, j, LIBELLES.get(col, col))
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=BLEU)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = BORD
+
+
+def ecrire_tableau(ws, t, ligne, titre=None, fmt_defaut=None):
+    """Ecrit un DataFrame mis en forme. Renvoie (ligne d'entete, prochaine ligne libre)."""
+    if titre:
+        ligne = titre_section(ws, ligne, titre)
+    h = ligne
+    entete(ws, h, t.columns)
+    for i, row in enumerate(t.itertuples(index=False), h + 1):
+        total = str(row[0]) == "Total"
+        for j, (col, v) in enumerate(zip(t.columns, row), 1):
+            v = valeur(v)
+            c = ws.cell(i, j, v)
+            c.border = BORD
+            f = fmt_col(col) or fmt_defaut
+            if f is None and isinstance(v, (int, float)) and not isinstance(v, bool):
+                f = FMT_INT if isinstance(v, int) else FMT_DEC
+            if f:
+                c.number_format = f
+            if total:
+                c.font = Font(bold=True)
+                c.fill = PatternFill("solid", fgColor=BLEU_CLAIR)
+            elif (i - h) % 2 == 0:
+                c.fill = PatternFill("solid", fgColor=GRIS)
+    return h, h + len(t) + 2
+
+
+def ecrire_kv(ws, items, ligne, titre=None):
+    """Tableau indicateur / valeur ; items = [(libelle, valeur, format)]."""
+    if titre:
+        ligne = titre_section(ws, ligne, titre)
+    entete(ws, ligne, ["Indicateur", "Valeur"])
+    for i, (lib, v, f) in enumerate(items, ligne + 1):
+        a, b = ws.cell(i, 1, lib), ws.cell(i, 2, valeur(v))
+        for c in (a, b):
+            c.border = BORD
+            if (i - ligne) % 2 == 0:
+                c.fill = PatternFill("solid", fgColor=GRIS)
+        if f:
+            b.number_format = f
+        b.alignment = Alignment(horizontal="right")
+    return ligne + len(items) + 2
+
+
+def barres(ws, titre, h, n, col_cat, col_val, ancre, horizontal=False):
+    if n <= 0:
+        return
+    ch = BarChart()
+    ch.type = "bar" if horizontal else "col"
+    ch.title, ch.style, ch.legend = titre, 10, None
+    ch.add_data(Reference(ws, min_col=col_val, min_row=h, max_row=h + n), titles_from_data=True)
+    ch.set_categories(Reference(ws, min_col=col_cat, min_row=h + 1, max_row=h + n))
+    ch.series[0].graphicalProperties.solidFill = "2F5597"
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.height, ch.width = 7.5, 16
+    ws.add_chart(ch, ancre)
+
+
+def ajuster_largeurs(ws, mini=10, maxi=45):
+    larg = {}
+    for row in ws.iter_rows():
+        for c in row:
+            if c.value is None or (ws.title, c.coordinate) in TITRES:
+                continue
+            l = 12 if isinstance(c.value, float) else len(str(c.value))
+            larg[c.column_letter] = max(larg.get(c.column_letter, 0), l)
+    for col, l in larg.items():
+        ws.column_dimensions[col].width = max(mini, min(maxi, l + 2))
 
 
 # =============================================================================
-# Helpers
+# Lecture et preparation
 # =============================================================================
-def agg_base():
-    return [F.count("*").alias("nb_gestes"),
-            F.countDistinct("num_cnt_ben").alias("nb_contrats"),
-            F.countDistinct("id_prs").alias("nb_clients"),
-            F.round(F.sum("montant"), 2).alias("montant_total"),
-            F.round(F.avg("montant"), 2).alias("montant_moyen"),
-            F.expr("percentile_approx(montant, 0.5)").alias("montant_median")]
+def lire(chemin):
+    p = Path(chemin)
+    types = {"id_prs": str, "num_cnt_ben": str}
+    if p.suffix.lower() == ".parquet":
+        return pd.read_parquet(p)
+    if p.suffix.lower() in (".xlsx", ".xls"):
+        return pd.read_excel(p, dtype=types)
+    with open(p, encoding="utf-8-sig") as f:
+        sep = csv.Sniffer().sniff(f.readline(), delimiters=",;\t|").delimiter
+    return pd.read_csv(p, sep=sep, dtype=types, encoding="utf-8-sig", low_memory=False)
 
 
-def ajouter_pct(pdf, col="nb_gestes"):
-    pdf["pct_" + col] = (100.0 * pdf[col] / pdf[col].sum()).round(1)
-    return pdf
+def ordonner(s, ordre):
+    present = set(s.dropna())
+    cats = [c for c in ordre if c in present] + sorted(present - set(ordre))
+    return pd.Categorical(s, categories=cats, ordered=True)
 
 
-def par(*cols):
-    """Volumes + montants par modalite(s), avec % du total des gestes."""
-    return ajouter_pct(df.groupBy(*cols).agg(*agg_base()).orderBy(*cols).toPandas())
+def preparer(df):
+    requis = [COL_MONTANT, "id_prs", "num_cnt_ben", "mois_geste", "type_compte", "categorie_eligibilite"]
+    manquantes = [c for c in requis if c not in df.columns]
+    if manquantes:
+        raise SystemExit("Colonnes absentes : %s\nColonnes disponibles : %s" % (manquantes, list(df.columns)))
 
+    df = df.copy()
+    df["montant"] = pd.to_numeric(
+        df[COL_MONTANT].astype(str).str.replace("\u00a0", "").str.replace(" ", "").str.replace(",", "."),
+        errors="coerce")
 
-def croise(ligne, colonne):
-    """Tableau croise (nb de gestes) ligne x colonne."""
-    return (df.groupBy(ligne).pivot(colonne).count()
-              .orderBy(ligne).toPandas().fillna(0))
+    m = pd.to_numeric(df["mois_geste"], errors="coerce").astype("Int64")
+    s = m.astype(str)
+    df["mois"] = np.where(m.notna(), s.str[:4] + "-" + s.str[4:6], "Non renseigné")
 
+    for col, _, _ in FLAGS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-def tranche_montant(col):
-    expr = F.when(F.col(col).isNull(), "Montant manquant").when(F.col(col) < 0, "Negatif")
-    for i, (a, b) in enumerate(zip(TRANCHES[:-1], TRANCHES[1:]), start=1):
-        expr = expr.when(F.col(col) < b, "{:02d}. [{:g} ; {:g}[".format(i, a, b))
-    return expr.otherwise("{:02d}. {:g} et +".format(len(TRANCHES), TRANCHES[-1]))
+    df["type_compte"] = ordonner(df["type_compte"].fillna("Contrat non retrouve").replace(LIB_TYPE), ORDRE_TYPE)
+    df["categorie_eligibilite"] = ordonner(
+        df["categorie_eligibilite"].fillna("Contrat non retrouve").replace(LIB_CATEG), ORDRE_CATEG)
 
+    if "cd_seg_com_marche_aff_av_fra" in df.columns:
+        df["segment_marche"] = df["cd_seg_com_marche_aff_av_fra"].map(
+            lambda x: LIB_MARCHE.get(x, x) if pd.notna(x) else "Non renseigné")
+    if "cd_seg_com_engag_stb" in df.columns:
+        e = pd.to_numeric(df["cd_seg_com_engag_stb"], errors="coerce").astype("Int64")
+        df["segment_engagement"] = e.astype(str).where(e.notna(), "Non renseigné")
+    for src, dst in [("TOP_PRESENT_SEG_202512", "presence_12_2025"), ("TOP_PRESENT_SEG_202608", "presence_08_2026")]:
+        if src in df.columns:
+            df[dst] = np.where(pd.to_numeric(df[src], errors="coerce") == 1, "Oui", "Non")
 
-tables = {}
+    def tranche(v):
+        if pd.isna(v):
+            return "Montant manquant"
+        if v < 0:
+            return "Négatif"
+        for a, b in zip(TRANCHES[:-1], TRANCHES[1:]):
+            if v < b:
+                return "[%g ; %g[ €" % (a, b)
+        return "%g € et +" % TRANCHES[-1]
 
-# =============================================================================
-# 1. Synthese
-# =============================================================================
-synth = df.agg(
-    *agg_base(),
-    F.sum((F.col("type_compte") == "Individuel").cast("int")).alias("nb_gestes_cpt_individuels"),
-    F.sum((F.col("type_compte") == "Joint").cast("int")).alias("nb_gestes_cpt_joints"),
-    F.sum((F.col("type_compte") == "Contrat non retrouve").cast("int")).alias("nb_gestes_contrat_non_retrouve"),
-    F.countDistinct(F.when(F.col("type_compte") == "Individuel", F.col("num_cnt_ben"))).alias("nb_cpt_individuels_distincts"),
-    F.countDistinct(F.when(F.col("type_compte") == "Joint", F.col("num_cnt_ben"))).alias("nb_cpt_joints_distincts"),
-    F.sum("TOP_ELIGIBLE").alias("nb_gestes_eligibles"),
-    F.sum(F.col("montant").isNull().cast("int")).alias("nb_montants_manquants"),
-).toPandas()
-synth = synth.T.reset_index()
-synth.columns = ["indicateur", "valeur"]
-tables["Synthese"] = synth
+    ordre_tr = (["Négatif"] + ["[%g ; %g[ €" % (a, b) for a, b in zip(TRANCHES[:-1], TRANCHES[1:])]
+                + ["%g € et +" % TRANCHES[-1], "Montant manquant"])
+    df["tranche_montant"] = ordonner(df["montant"].map(tranche), ordre_tr)
+    return df
 
-# =============================================================================
-# 2. Volumes dans le temps
-# =============================================================================
-tables["Par_mois"] = par("mois_geste")
-tables["Mois_x_type_compte"] = croise("mois_geste", "type_compte")
-tables["Mois_x_eligibilite"] = croise("mois_geste", "categorie_eligibilite")
-
-# =============================================================================
-# 3. Comptes individuels / joints
-# =============================================================================
-tables["Type_compte"] = par("type_compte")
-
-# =============================================================================
-# 4. Eligibilite
-# =============================================================================
-tables["Eligibilite_categorie"] = par("categorie_eligibilite")          # exclusive
-
-crit = df.agg(*[F.sum(c).alias(c) for c in FLAGS]).toPandas().T.reset_index()
-crit.columns = ["critere", "nb_gestes"]
-crit["pct_gestes"] = (100.0 * crit["nb_gestes"] / NB_GESTES).round(1)
-tables["Eligibilite_criteres"] = crit                                    # non exclusive
-
-tables["Type_cpt_x_eligibilite"] = par("type_compte", "categorie_eligibilite")
-tables["Segment_marche"] = par("cd_seg_com_marche_aff_av_fra")
-tables["Segment_engagement"] = par("cd_seg_com_engag_stb")
 
 # =============================================================================
-# 5. Distribution des montants
+# Agregations
 # =============================================================================
-q = df.select(F.expr("percentile_approx(montant, array({}))".format(
-    ", ".join(str(x) for x in QUANTILES)))).first()[0]
-d = df.agg(F.count("montant").alias("n"), F.min("montant").alias("min"),
-           F.max("montant").alias("max"), F.avg("montant").alias("moyenne"),
-           F.stddev("montant").alias("ecart_type"), F.sum("montant").alias("somme")).first()
-dist = [("nb montants renseignes", d["n"]), ("somme", d["somme"]), ("moyenne", d["moyenne"]),
-        ("ecart-type", d["ecart_type"]), ("min", d["min"])]
-dist += [("P{:g}".format(100 * p), v) for p, v in zip(QUANTILES, q or [None] * len(QUANTILES))]
-dist += [("max", d["max"])]
-tables["Distribution_montant"] = pd.DataFrame(dist, columns=["statistique", "valeur"]).round(2)
+def stats(d):
+    return dict(nb_gestes=len(d), nb_contrats=d["num_cnt_ben"].nunique(), nb_clients=d["id_prs"].nunique(),
+                montant_total=d["montant"].sum(), montant_moyen=d["montant"].mean(),
+                montant_median=d["montant"].median())
 
-tables["Tranches_montant"] = par(tranche_montant("montant").alias("tranche_montant"))
-tables["Tranches_x_type_compte"] = (df.withColumn("tranche_montant", tranche_montant("montant"))
-                                      .groupBy("tranche_montant").pivot("type_compte").count()
-                                      .orderBy("tranche_montant").toPandas().fillna(0))
+
+def par(df, cols, total=True):
+    cols = [cols] if isinstance(cols, str) else list(cols)
+    lignes = []
+    for k, g in df.groupby(cols, observed=True, sort=True):
+        k = k if isinstance(k, tuple) else (k,)
+        lignes.append({**dict(zip(cols, k)), **stats(g)})
+    if total:
+        lignes.append({**{c: ("Total" if i == 0 else "") for i, c in enumerate(cols)}, **stats(df)})
+    t = pd.DataFrame(lignes)
+    t.insert(len(cols) + 1, "pct_gestes", t["nb_gestes"] / len(df))
+    return t
+
+
+def _ordre(s):
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        return [str(x) for x in s.cat.categories]
+    return sorted(s.dropna().astype(str).unique())
+
+
+def croise(df, l, c, normalise=False):
+    ct = pd.crosstab(df[l].astype(str), df[c].astype(str), margins=True, margins_name="Total",
+                     normalize="index" if normalise else False)
+    ct = ct.reindex(index=[x for x in _ordre(df[l]) + ["Total"] if x in ct.index],
+                    columns=[x for x in _ordre(df[c]) + ["Total"] if x in ct.columns])
+    ct.index.name, ct.columns.name = l, None
+    return ct.reset_index()
+
 
 # =============================================================================
-# 6. Recurrence : nombre de gestes par client
+# Construction du classeur
 # =============================================================================
-gpc = (df.filter(F.col("id_prs").isNotNull())
-         .groupBy("id_prs").agg(F.count("*").alias("n"), F.sum("montant").alias("mt"))
-         .withColumn("nb_gestes_client", F.when(F.col("n") >= 5, "5 et +").otherwise(F.col("n").cast("string")))
-         .groupBy("nb_gestes_client")
-         .agg(F.count("*").alias("nb_clients"), F.round(F.avg("mt"), 2).alias("montant_moyen_cumule"))
-         .orderBy("nb_gestes_client").toPandas())
-tables["Gestes_par_client"] = ajouter_pct(gpc, "nb_clients")
+def main():
+    df = preparer(lire(FICHIER_ENTREE))
+    n = len(df)
+    mois_ok = sorted(m for m in df["mois"].unique() if m != "Non renseigné")
+    periode = "%s à %s" % (mois_ok[0], mois_ok[-1]) if mois_ok else "n.d."
+    st = "Période : %s  |  %s gestes  |  produit le %s" % (periode, format(n, ",").replace(",", " "),
+                                                          date.today().strftime("%d/%m/%Y"))
+    wb = Workbook()
+    wb.remove(wb.active)
 
-# =============================================================================
-# 7. Presence dans le socle seg
-# =============================================================================
-tables["Presence_socle"] = par("TOP_PRESENT_SEG_202512", "TOP_PRESENT_SEG_202608")
+    # ---- 1. Synthese
+    ws = nouvelle_feuille(wb, "Synthèse", "Gestes commerciaux - synthèse", st)
+    tc = df["type_compte"].astype(str)
+    s = stats(df)
+    items = [
+        ("Période couverte", periode, None),
+        ("Nb gestes", n, FMT_INT),
+        ("Nb contrats distincts", s["nb_contrats"], FMT_INT),
+        ("Nb clients distincts", s["nb_clients"], FMT_INT),
+        ("Montant total", s["montant_total"], FMT_EUR),
+        ("Montant moyen par geste", s["montant_moyen"], FMT_EUR),
+        ("Montant médian par geste", s["montant_median"], FMT_EUR),
+        ("Gestes sur comptes individuels", (tc == "Individuel").sum(), FMT_INT),
+        ("Gestes sur comptes joints", (tc == "Joint").sum(), FMT_INT),
+        ("% gestes sur comptes joints", (tc == "Joint").mean(), FMT_PCT),
+        ("Comptes individuels distincts", df.loc[tc == "Individuel", "num_cnt_ben"].nunique(), FMT_INT),
+        ("Comptes joints distincts", df.loc[tc == "Joint", "num_cnt_ben"].nunique(), FMT_INT),
+        ("Gestes dont le contrat n'est pas retrouvé", (tc == "Contrat non retrouvé").sum(), FMT_INT),
+    ]
+    if "TOP_ELIGIBLE" in df.columns:
+        items += [("Gestes sur client éligible", df["TOP_ELIGIBLE"].sum(), FMT_INT),
+                  ("% gestes sur client éligible", df["TOP_ELIGIBLE"].mean(), FMT_PCT)]
+    items += [("Montants manquants", df["montant"].isna().sum(), FMT_INT)]
+    ecrire_kv(ws, items, 4)
+    ajuster_largeurs(ws)
 
-# =============================================================================
-# Export Excel dans le dossier gere
-# =============================================================================
-buf = io.BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    for nom, t in tables.items():
-        onglet = nom[:31]
-        t.to_excel(xw, sheet_name=onglet, index=False)
-        ws = xw.sheets[onglet]
-        ws.freeze_panes = "A2"
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        for cells in ws.columns:
-            largeur = max(len(str(c.value)) if c.value is not None else 0 for c in cells)
-            ws.column_dimensions[cells[0].column_letter].width = min(45, largeur + 2)
-buf.seek(0)
-dataiku.Folder(DOSSIER_SORTIE).upload_stream(FICHIER, buf)
-print("Export OK :", FICHIER, "-", len(tables), "onglets,", NB_GESTES, "gestes")
+    # ---- 2. Evolution mensuelle
+    ws = nouvelle_feuille(wb, "Par mois", "Volume des gestes par mois", st)
+    t = par(df, "mois")
+    h, _ = ecrire_tableau(ws, t, 4)
+    ancre = get_column_letter(len(t.columns) + 2)
+    barres(ws, "Nb gestes par mois", h, len(t) - 1, 1, t.columns.get_loc("nb_gestes") + 1, "%s%d" % (ancre, h))
+    barres(ws, "Montant total par mois", h, len(t) - 1, 1, t.columns.get_loc("montant_total") + 1,
+           "%s%d" % (ancre, h + 16))
+    ajuster_largeurs(ws)
+
+    # ---- 3. Comptes individuels / joints
+    ws = nouvelle_feuille(wb, "Type de compte", "Comptes individuels vs comptes joints", st)
+    t = par(df, "type_compte")
+    h, nxt = ecrire_tableau(ws, t, 4, "Répartition par type de compte")
+    barres(ws, "Nb gestes par type de compte", h, len(t) - 1, 1, 2,
+           "%s%d" % (get_column_letter(len(t.columns) + 2), h))
+    nxt = max(nxt, h + 17)
+    ecrire_tableau(ws, croise(df, "mois", "type_compte"), nxt, "Nb gestes par mois et type de compte")
+    ajuster_largeurs(ws)
+
+    # ---- 4. Eligibilite
+    ws = nouvelle_feuille(wb, "Éligibilité", "Répartition par éligibilité", st)
+    t = par(df, "categorie_eligibilite")
+    h, nxt = ecrire_tableau(ws, t, 4, "Catégorie d'éligibilité (exclusive, hiérarchisée)")
+    barres(ws, "Nb gestes par catégorie", h, len(t) - 1, 1, 2,
+           "%s%d" % (get_column_letter(len(t.columns) + 2), h), horizontal=True)
+    nxt = max(nxt, h + 17)
+    crit = pd.DataFrame([{"famille": fam, "critere": lib, "nb_gestes": df[c].sum(), "pct_gestes": df[c].mean()}
+                         for c, lib, fam in FLAGS if c in df.columns])
+    if len(crit):
+        _, nxt = ecrire_tableau(ws, crit, nxt, "Critères d'éligibilité (non exclusifs : un geste peut cumuler)")
+    _, nxt = ecrire_tableau(ws, croise(df, "type_compte", "categorie_eligibilite"), nxt,
+                            "Nb gestes par type de compte et catégorie")
+    _, nxt = ecrire_tableau(ws, croise(df, "mois", "categorie_eligibilite"), nxt,
+                            "Nb gestes par mois et catégorie")
+    ecrire_tableau(ws, croise(df, "mois", "categorie_eligibilite", normalise=True), nxt,
+                   "Répartition (%) des gestes du mois par catégorie", fmt_defaut=FMT_PCT)
+    ajuster_largeurs(ws)
+
+    # ---- 5. Montants
+    ws = nouvelle_feuille(wb, "Montants", "Distribution des montants", st)
+    m = df["montant"].dropna()
+    dist = [("Nb montants renseignés", len(m), FMT_INT),
+            ("Nb montants manquants", df["montant"].isna().sum(), FMT_INT),
+            ("Somme", m.sum(), FMT_EUR), ("Moyenne", m.mean(), FMT_EUR),
+            ("Écart-type", m.std(), FMT_EUR), ("Minimum", m.min(), FMT_EUR)]
+    dist += [("Percentile %g" % (q * 100), m.quantile(q) if len(m) else None, FMT_EUR) for q in QUANTILES]
+    dist += [("Maximum", m.max(), FMT_EUR)]
+    nxt = ecrire_kv(ws, dist, 4, "Statistiques descriptives")
+    t = par(df, "tranche_montant")
+    h, nxt = ecrire_tableau(ws, t, nxt, "Répartition par tranche de montant")
+    barres(ws, "Nb gestes par tranche de montant", h, len(t) - 1, 1, 2,
+           "%s%d" % (get_column_letter(len(t.columns) + 2), h))
+    nxt = max(nxt, h + 17)
+    _, nxt = ecrire_tableau(ws, croise(df, "tranche_montant", "type_compte"), nxt,
+                            "Nb gestes par tranche et type de compte")
+    ecrire_tableau(ws, croise(df, "tranche_montant", "categorie_eligibilite"), nxt,
+                   "Nb gestes par tranche et catégorie d'éligibilité")
+    ajuster_largeurs(ws)
+
+    # ---- 6. Segments
+    seg_cols = [c for c in ["segment_marche", "segment_engagement"] if c in df.columns]
+    if seg_cols:
+        ws = nouvelle_feuille(wb, "Segments", "Répartition par segment (mois précédant le geste)", st)
+        nxt = 4
+        for c in seg_cols:
+            _, nxt = ecrire_tableau(ws, par(df, c), nxt, LIBELLES[c])
+        ajuster_largeurs(ws)
+
+    # ---- 7. Recurrence
+    ws = nouvelle_feuille(wb, "Récurrence", "Nombre de gestes par client", st)
+    pc = df.dropna(subset=["id_prs"]).groupby("id_prs").agg(n=("montant", "size"), mt=("montant", "sum"))
+    pc["nb_gestes_client"] = np.where(pc["n"] >= 5, "5 et +", pc["n"].astype(str))
+    t = (pc.groupby("nb_gestes_client").agg(nb_clients=("n", "size"), montant_moyen_cumule=("mt", "mean"))
+           .reset_index())
+    t.insert(2, "pct_clients", t["nb_clients"] / t["nb_clients"].sum())
+    h, _ = ecrire_tableau(ws, t, 4)
+    barres(ws, "Nb clients selon le nb de gestes reçus", h, len(t), 1, 2,
+           "%s%d" % (get_column_letter(len(t.columns) + 2), h))
+    ajuster_largeurs(ws)
+
+    # ---- 8. Presence dans le socle
+    pres = [c for c in ["presence_12_2025", "presence_08_2026"] if c in df.columns]
+    if pres:
+        ws = nouvelle_feuille(wb, "Présence socle", "Présence du client retenu dans le socle seg", st)
+        _, nxt = ecrire_tableau(ws, par(df, pres), 4, "Tous gestes")
+        jan = df[df["mois"] == "2026-01"]
+        if len(jan):
+            ecrire_tableau(ws, par(jan, pres), nxt, "Gestes de janvier 2026")
+        ajuster_largeurs(ws)
+
+    # ---- 9. Notes de lecture
+    ws = nouvelle_feuille(wb, "Notes", "Notes de lecture et définitions")
+    notes = [
+        "Unité : 1 ligne = 1 geste commercial. Les % gestes sont calculés sur le total des gestes.",
+        "Rattachement : le n° de contrat est extrait du libellé du geste puis rapproché du bloc contrat.",
+        "Choix de la personne : si une seule personne sur le contrat, elle est retenue ; sinon la personne "
+        "éligible ; si plusieurs (ou aucune) sont éligibles, la plus engagée.",
+        "Éligibilité : patrimonial (A), adulte à enjeux (B), jeune (D/E), multi-équipé (engagement 5), "
+        "ou lien familial (conjoint / descendant) avec un client éligible.",
+        "Segments et éligibilité sont lus sur le mois précédant le geste.",
+        "Catégorie exclusive, ordre de priorité : Patrimonial > Adulte à enjeux > Multi-équipé > Jeune > "
+        "Lien familial éligible > Non éligible.",
+        "Nb contrats / Nb clients : valeurs distinctes ; un contrat ou un client peut avoir plusieurs gestes.",
+        "Médianes et percentiles calculés sur les montants renseignés.",
+    ]
+    for i, txt in enumerate(notes, 4):
+        c = ws.cell(i, 1, "• " + txt)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[i].height = 32
+    ws.column_dimensions["A"].width = 120
+
+    wb.save(FICHIER_SORTIE)
+    print("Livrable écrit : %s (%d onglets, %d gestes)" % (FICHIER_SORTIE, len(wb.sheetnames), n))
+
+
+if __name__ == "__main__":
+    main()
