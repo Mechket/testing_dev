@@ -1,0 +1,306 @@
+# -*- coding: utf-8 -*-
+"""
+Cohortes gestes co : evolution des beneficiaires avant / apres le geste, sur le modele eDixit.
+
+Groupes :
+  - Beneficiaire              : clients ayant recu un geste sur [GESTE_DEB ; GESTE_FIN],
+                                mois de reference = mois de leur PREMIER geste
+  - Eligible non beneficiaire : echantillon de clients eligibles sans geste, a qui on attribue
+                                un mois de reference fictif tire selon la meme distribution
+                                que les beneficiaires ; ils doivent etre eligibles a M-1
+
+Horizons (par rapport au mois de reference, propre a chaque client) :
+  Mm1 = mois precedent le geste (AVANT), M = mois du geste, M3, M6, M12
+
+Attrition (sans biais de survie : aucune condition de presence a la fin) :
+  TOP_DISPO_<h>   = 1 si le mois cible est deja disponible dans les donnees
+  TOP_PRESENT_<h> = 1 si le client est present dans le socle seg ce mois-la
+  statut_<h>      = Present / Absent du socle / Non observable (horizon pas encore atteint)
+
+Sortie : cohortes_gestes_co -> 1 ligne par client, metriques suffixees _Mm1, _M, _M3, _M6, _M12
+"""
+import dataiku
+from dataiku import spark as dkuspark
+from pyspark import SparkContext
+from pyspark.sql import SQLContext, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+sparkSession = (SparkSession
+    .builder
+    .config('spark.driver.memory', '40g')
+    .config('spark.executor.memory', '16g')
+    .config('spark.executor.instances', 10)
+    .config('spark.sql.autoBroadcastJoinThreshold', -1)
+    .config('spark.sql.parquet.writeLegacyFormat', True)
+    .enableHiveSupport()
+    .getOrCreate())
+sc = SparkContext.getOrCreate()
+sqlContext = SQLContext(sc)
+
+# =============================================================================
+# Parametres (A ADAPTER)
+# =============================================================================
+GESTE_DEB, GESTE_FIN = 202601, 202608   # periode des gestes etudies (2025 si la table remonte assez loin)
+DATA_FIN = 202610                       # dernier mois disponible dans les blocs marketing
+HORIZONS = [(-1, "Mm1"), (0, "M"), (3, "M3"), (6, "M6"), (12, "M12")]
+FRAC_TEMOINS = 0.05                     # part de la base tiree pour le groupe temoin
+SEED = 42
+DATE_MAX_LIEN = "2026-08-31"
+TYPES_LIEN = ["C", "D"]                 # conjoint / descendant (le client est l'ascendant du lie)
+COL_MONTANT = "MNT_OPE"                 # colonne montant dans benef_gestes_co (ignoree si absente)
+PNB_PARTS = {"2025": "2025_RG2025",     # annee_regle_part du PNB : verifier les valeurs reelles
+             "2026": "."}
+
+SUFFIXES = [s for _, s in HORIZONS]
+
+
+def ym_add(ym, n):
+    """Ajoute n mois a un entier YYYYMM (cote Python)."""
+    y, m = divmod(ym // 100 * 12 + ym % 100 - 1 + n, 12)
+    return y * 100 + m + 1
+
+
+PERIM_DEB = ym_add(GESTE_DEB, min(h for h, _ in HORIZONS))
+PERIM_FIN = min(DATA_FIN, ym_add(GESTE_FIN, max(h for h, _ in HORIZONS)))
+
+
+def ym_to_date(c):
+    return F.to_date(F.concat(c.cast("string"), F.lit("01")), "yyyyMMdd")
+
+
+def date_to_ym(c):
+    return F.date_format(c, "yyyyMM").cast("int")
+
+
+def lire(nom):
+    return dkuspark.get_dataframe(sqlContext, dataiku.Dataset(nom))
+
+
+# =============================================================================
+# Metriques (memes listes que eDixit, + engagement stb pour l'eligibilite)
+# =============================================================================
+socio_metrics = ["age_pph", "fcm_median", "nbr_mois_depuis_pre_ach", "lb_type_marche", "lb_csp_agg",
+                 "lb_anciennete_tr", "lb_fcm_median_tr", "lb_genre", "lb_situation_familiale", "lb_cap_jur",
+                 "lb_dex", "lb_dr", "cd_ptf", "top_pre_cib", "pinv"]
+seg_metrics = ["cd_seg_com_marche_aff", "cd_seg_com_marche_aff_av_fra", "cd_seg_com_marche_stb",
+               "cd_seg_com_marche_stb_av_fra", "cd_seg_com_top_frag", "cd_seg_com_engag_aff",
+               "cd_seg_com_engag_stb", "cd_seg_com_top_nouveau", "cd_filiere_bpe", "cd_seg_com_top_mab",
+               "cd_seg_com_top_mab_comp", "cd_cluster_mkt"]
+equip_metrics = ["top_det_gam_ass_vie", "top_det_gam_credit_perso", "top_det_gam_epa_log", "top_det_gam_epa_ord",
+                 "top_det_gam_iard", "top_det_gam_credit_immo", "top_det_gam_prev", "top_det_gam_sante",
+                 "top_det_gam_val_mob", "top_det_gam_aq_hors_ccp", "top_det_gam_autre", "srf_fnc_inst_tr",
+                 "top_det_certicode", "top_det_certicode_plus", "mnt_crd_credit_immo", "mnt_crd_credit_perso",
+                 "mnt_epa_disp", "mnt_epa_non_disp", "nbr_cnt_tot", "nbr_gam_tot", "recence_dernier_ach",
+                 "srf_ass_vie", "srf_ccp_moyen", "srf_epa_log", "srf_epa_ord", "srf_fnc_inst", "srf_val_mob"]
+relation_metrics = ["top_id_bel", "nbr_rdv_pgm_faf", "nbr_rdv_pgm_tel", "nbr_rdv_sptn_faf", "nbr_rdv_sptn_tel",
+                    "nbr_con_appel_srv_vocal", "nbr_contact_gui", "nbr_appel_cf"]
+epargne_metrics = ["nbr_cnt_cel", "nbr_cnt_ldd", "nbr_cnt_lep", "nbr_cnt_livret_a", "nbr_cnt_livret_b",
+                   "nbr_cnt_livret_jeune", "nbr_cnt_pel", "top_au_plafond_livret_a", "top_au_plafond_livret_jeune",
+                   "top_au_plafond_ldd", "top_au_plafond_lep", "top_au_plafond_cel", "top_au_plafond_pel",
+                   "mnt_encours_cel", "mnt_encours_ldd", "mnt_encours_lep", "mnt_encours_livret_a",
+                   "mnt_encours_livret_b", "mnt_encours_livret_jeune", "mnt_encours_pel"]
+aq_metrics = ["nbr_cnt_ccp", "top_mono_det_ccp", "nbr_cnt_chequier", "nbr_cnt_formule", "nbr_cnt_formule_simple"]
+CP_metrics = ["nbr_cnt_projet", "nbr_cnt_travaux", "nbr_cnt_auto_credit", "nbr_cnt_etudiant", "nbr_cnt_rachat",
+              "nbr_cnt_autres_perso", "nbr_cnt_micro", "nbr_cnt_renouvelable", "mnt_crd_projet", "mnt_crd_travaux",
+              "mnt_crd_auto_credit", "mnt_crd_etudiant", "mnt_crd_rachat", "mnt_crd_autres_perso", "mnt_crd_micro",
+              "mnt_crd_renouvelable"]
+
+top_aq = ["nbr_cnt_ccp", "nbr_cnt_chequier", "nbr_cnt_formule", "nbr_cnt_formule_simple"]
+top_epargne = ["nbr_cnt_cel", "nbr_cnt_ldd", "nbr_cnt_lep", "nbr_cnt_livret_a", "nbr_cnt_livret_b",
+               "nbr_cnt_livret_jeune", "nbr_cnt_pel"]
+top_cp = ["nbr_cnt_projet", "nbr_cnt_travaux", "nbr_cnt_auto_credit", "nbr_cnt_etudiant", "nbr_cnt_rachat",
+          "nbr_cnt_autres_perso", "nbr_cnt_renouvelable"]
+
+BLOCS = [  # (dataset, metriques, variables nbr_cnt_* a transformer en top_det_* OUI/NON)
+    ("bloc_socio_dem_cur_ext", socio_metrics, []),
+    ("bloc_seg_cur_ext", seg_metrics, []),
+    ("bloc_equipement_cur_ext", equip_metrics, []),
+    ("bloc_relation_client_cur_ext", relation_metrics, []),
+    ("bloc_epargne_cur_ext", epargne_metrics, top_epargne),
+    ("bloc_aq_cur_ext", aq_metrics, top_aq),
+    ("bloc_credit_perso_cur_ext", CP_metrics, top_cp),
+]
+
+
+def lire_bloc(nom, metrics, tops):
+    df = (lire(nom)
+          .filter(F.col("annee_mois_part").cast("int").between(PERIM_DEB, PERIM_FIN))
+          .select(["id_prs", F.col("annee_mois_part").cast("int").alias("mois_cible")] + metrics)
+          .dropDuplicates(["id_prs", "mois_cible"]))
+    cols = list(metrics)
+    for c in tops:
+        df = df.withColumn("top_det_" + c[8:], F.when(F.col(c) > 0, "OUI").otherwise("NON"))
+        cols.append("top_det_" + c[8:])
+    return df, cols
+
+
+# =============================================================================
+# 1. Socle seg mensuel + eligibilite directe (sert a l'eligibilite et a la presence)
+# =============================================================================
+seg_elig = (
+    lire("bloc_seg_cur_ext")
+    .filter(F.col("annee_mois_part").cast("int").between(PERIM_DEB, PERIM_FIN))
+    .select("id_prs", F.col("annee_mois_part").cast("int").alias("mois"),
+            "cd_seg_com_marche_aff_av_fra",
+            F.col("cd_seg_com_engag_stb").cast("int").alias("engag"))
+    .dropDuplicates(["id_prs", "mois"])
+    .withColumn("TOP_ELIG_DIRECT",
+                (F.col("cd_seg_com_marche_aff_av_fra").isin("A", "B", "D", "E")
+                 | (F.col("engag") == 5)).cast("int"))
+    .fillna(0, subset=["TOP_ELIG_DIRECT"])
+    .select("id_prs", "mois", "TOP_ELIG_DIRECT")
+    .cache()
+)
+
+liens = (
+    lire("lbp_al42_repr_pph_active_q")
+    .filter(F.col("type_lien_partenaires").isin(TYPES_LIEN)
+            & (F.to_date(F.col("date_de_creation")) <= F.lit(DATE_MAX_LIEN)))
+    .select(F.col("identifiant_partenaire").alias("id_prs"),
+            F.col("identifiant_partenaire_lie").alias("id_prs_lie"))
+    .distinct()
+)
+
+# =============================================================================
+# 2. Beneficiaires : premier geste de la periode
+# =============================================================================
+gestes = (lire("benef_gestes_co")
+          .filter(F.col("id_prs").isNotNull()
+                  & F.col("mois_geste").cast("int").between(GESTE_DEB, GESTE_FIN)))
+has_mnt = COL_MONTANT in gestes.columns
+if has_mnt:
+    gestes = gestes.withColumn("_mnt", F.regexp_replace(F.col(COL_MONTANT).cast("string"), ",", ".").cast("double"))
+
+w_cli = Window.partitionBy("id_prs")
+w_first = Window.partitionBy("id_prs").orderBy(F.col("mois_geste").asc(), F.col("id_geste").asc())
+benef = (
+    gestes
+    .withColumn("nb_gestes_periode", F.count(F.lit(1)).over(w_cli))
+    .withColumn("mnt_gestes_periode", F.sum("_mnt").over(w_cli) if has_mnt else F.lit(None).cast("double"))
+    .withColumn("_rk", F.row_number().over(w_first))
+    .filter(F.col("_rk") == 1)
+    .select("id_prs",
+            F.col("mois_geste").cast("int").alias("mois_ref"),
+            F.lit("Beneficiaire").alias("groupe"),
+            F.col("TOP_ELIGIBLE").cast("int").alias("TOP_ELIGIBLE_REF"),
+            F.col("categorie_eligibilite").alias("categorie_eligibilite_ref"),
+            F.col("type_compte").alias("type_compte_ref"),
+            "nb_gestes_periode", "mnt_gestes_periode")
+    .cache()
+)
+
+# =============================================================================
+# 3. Temoins : eligibles non beneficiaires avec un mois de reference fictif
+#    tire selon la distribution des mois de geste des beneficiaires
+# =============================================================================
+dist = benef.groupBy("mois_ref").count().orderBy("mois_ref").collect()
+total = float(sum(r["count"] for r in dist))
+tirage, cum = None, 0.0
+for r in dist:
+    cum += r["count"] / total
+    tirage = (F.when(F.col("_u") < cum, F.lit(r["mois_ref"])) if tirage is None
+              else tirage.when(F.col("_u") < cum, F.lit(r["mois_ref"])))
+tirage = tirage.otherwise(F.lit(dist[-1]["mois_ref"]))
+
+temoins = (
+    seg_elig.filter(F.col("mois") == ym_add(GESTE_DEB, -1)).select("id_prs").distinct()
+    .join(lire("benef_gestes_co").select("id_prs").distinct(), "id_prs", "left_anti")  # aucun geste
+    .sample(False, FRAC_TEMOINS, SEED)
+    .withColumn("_u", F.rand(SEED))
+    .withColumn("mois_ref", tirage.cast("int"))
+    .withColumn("mois_m1", date_to_ym(F.add_months(ym_to_date(F.col("mois_ref")), -1)))
+    .drop("_u")
+)
+
+# Eligibilite a M-1 : directe (socle seg) ou indirecte (lien avec un eligible direct)
+t_direct = temoins.join(seg_elig.withColumnRenamed("mois", "mois_m1"), ["id_prs", "mois_m1"], "inner")
+t_indirect = (
+    temoins.join(liens, "id_prs")
+    .join(seg_elig.filter(F.col("TOP_ELIG_DIRECT") == 1)
+                  .select(F.col("id_prs").alias("id_prs_lie"), F.col("mois").alias("mois_m1")),
+          ["id_prs_lie", "mois_m1"])
+    .select("id_prs", "mois_m1").distinct()
+    .withColumn("TOP_ELIG_INDIRECT", F.lit(1))
+)
+temoins = (
+    t_direct.join(t_indirect, ["id_prs", "mois_m1"], "left")
+    .fillna(0, subset=["TOP_ELIG_INDIRECT"])
+    .filter((F.col("TOP_ELIG_DIRECT") == 1) | (F.col("TOP_ELIG_INDIRECT") == 1))
+    .select("id_prs", "mois_ref",
+            F.lit("Eligible non beneficiaire").alias("groupe"),
+            F.lit(1).alias("TOP_ELIGIBLE_REF"),
+            F.lit(None).cast("string").alias("categorie_eligibilite_ref"),
+            F.lit(None).cast("string").alias("type_compte_ref"),
+            F.lit(0).cast("long").alias("nb_gestes_periode"),
+            F.lit(None).cast("double").alias("mnt_gestes_periode"))
+)
+
+cohorte = benef.union(temoins.select(benef.columns)).cache()
+
+# =============================================================================
+# 4. Mois cibles par horizon (1 ligne par client x horizon)
+# =============================================================================
+hz = sqlContext.createDataFrame([(h, s) for h, s in HORIZONS], ["h", "suffix"])
+targets = (
+    cohorte.select("id_prs", "mois_ref").crossJoin(hz)
+    .withColumn("mois_cible", date_to_ym(F.expr(
+        "add_months(to_date(concat(cast(mois_ref as string), '01'), 'yyyyMMdd'), h)")))
+    .select("id_prs", "suffix", "mois_cible")
+    .cache()
+)
+
+# Disponibilite des horizons (le mois cible existe-t-il deja dans les donnees ?)
+for h, s in HORIZONS:
+    cohorte = cohorte.withColumn(
+        "TOP_DISPO_" + s,
+        (date_to_ym(F.add_months(ym_to_date(F.col("mois_ref")), h)) <= DATA_FIN).cast("int"))
+
+# Presence dans le socle seg a chaque horizon
+presence = (
+    targets.join(seg_elig.select("id_prs", F.col("mois").alias("mois_cible")), ["id_prs", "mois_cible"])
+    .groupBy("id_prs")
+    .agg(*[F.max(F.when(F.col("suffix") == s, 1)).alias("TOP_PRESENT_" + s) for s in SUFFIXES])
+)
+cohorte = cohorte.join(presence, "id_prs", "left").fillna(0, subset=["TOP_PRESENT_" + s for s in SUFFIXES])
+for s in SUFFIXES:
+    cohorte = cohorte.withColumn(
+        "statut_" + s,
+        F.when(F.col("TOP_DISPO_" + s) == 0, "Non observable")
+         .when(F.col("TOP_PRESENT_" + s) == 1, "Present")
+         .otherwise("Absent du socle"))
+
+# =============================================================================
+# 5. Metriques par bloc : une seule jointure par bloc, puis pivot par horizon
+#    (jointures par nom de colonne uniquement, cf. bug "Resolved attribute(s)")
+# =============================================================================
+for nom, metrics, tops in BLOCS:
+    bloc, cols = lire_bloc(nom, metrics, tops)
+    pivot = (
+        targets.join(bloc, ["id_prs", "mois_cible"], "inner")
+        .groupBy("id_prs")
+        .agg(*[F.first(F.when(F.col("suffix") == s, F.col(c)), True).alias(c + "_" + s)
+               for c in cols for s in SUFFIXES])
+    )
+    cohorte = cohorte.join(pivot, "id_prs", "left")
+
+# PNB annuel (comme eDixit)
+pnb = lire("pnb_cur_ext").select("id_prs", "pnb_ok_bilan", "annee_regle_part")
+for annee, part in PNB_PARTS.items():
+    cohorte = cohorte.join(
+        pnb.filter(F.col("annee_regle_part") == part)
+           .select("id_prs", F.col("pnb_ok_bilan").alias("pnb_ok_bilan_" + annee))
+           .dropDuplicates(["id_prs"]),
+        "id_prs", "left")
+
+# =============================================================================
+# 6. Controles + ecriture
+# =============================================================================
+print("PERIMETRE MARKETING :", PERIM_DEB, "->", PERIM_FIN)
+for r in cohorte.groupBy("groupe").count().collect():
+    print("EFFECTIF", r["groupe"], ":", r["count"])
+for s in ["M6", "M12"]:
+    for r in cohorte.groupBy("groupe", "statut_" + s).count().orderBy("groupe").collect():
+        print("STATUT", s, r["groupe"], r["statut_" + s], ":", r["count"])
+
+dkuspark.write_with_schema(dataiku.Dataset("cohortes_gestes_co"), cohorte)
