@@ -1,0 +1,327 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.utils import get_column_letter
+
+
+# ============================================================
+# 1. PARAMETRES A MODIFIER
+# ============================================================
+
+COLONNE_MOIS_ENTRETIEN = "entretien_mois"
+
+METRICS = [
+    'fcm_median', 'mnt_crd_credit_immo', 'mnt_crd_credit_perso',
+    'mnt_epa_disp', 'mnt_epa_non_disp',
+    'srf_ass_vie', 'srf_ccp_moyen', 'srf_epa_log', 'srf_epa_ord',
+    'srf_fnc_inst', 'srf_val_mob', 'mnt_encours_cel', 'mnt_encours_ldd', 'mnt_encours_lep',
+    'mnt_encours_livret_a', 'mnt_encours_livret_b', 'mnt_encours_livret_jeune',
+    'mnt_encours_pel', 'nbr_cnt_tot', 'nbr_gam_tot'
+]
+
+HORIZONS = {
+    "M-1": "_P1",
+    "M": "_M",
+    "M+1": "_M1",
+    "M+3": "_M3",
+    "M+6": "_M6",
+}
+
+# Libellés affichés dans le tableau (à ajuster ; sinon le nom de la colonne est utilisé)
+LIBELLES = {
+    'fcm_median': "FCM médian",
+    'mnt_crd_credit_immo': "Capital restant dû crédit immobilier",
+    'mnt_crd_credit_perso': "Capital restant dû crédit perso",
+    'mnt_epa_disp': "Épargne disponible",
+    'mnt_epa_non_disp': "Épargne non disponible",
+    'srf_ass_vie': "SF assurance vie",
+    'srf_ccp_moyen': "SF CCP moyen",
+    'srf_epa_log': "SF épargne logement",
+    'srf_epa_ord': "SF épargne ordinaire",
+    'srf_fnc_inst': "SF fnc inst",
+    'srf_val_mob': "SF valeurs mobilières",
+    'mnt_encours_cel': "Encours CEL",
+    'mnt_encours_ldd': "Encours LDD",
+    'mnt_encours_lep': "Encours LEP",
+    'mnt_encours_livret_a': "Encours Livret A",
+    'mnt_encours_livret_b': "Encours Livret B",
+    'mnt_encours_livret_jeune': "Encours Livret Jeune",
+    'mnt_encours_pel': "Encours PEL",
+    'nbr_cnt_tot': "Nombre de contrats",
+    'nbr_gam_tot': "Nombre de gammes",
+}
+
+# Métriques qui ne sont PAS des euros (affichées avec 2 décimales)
+METRIQUES_NON_EURO = ['nbr_cnt_tot', 'nbr_gam_tot']
+
+# Blocs verticaux à afficher : "moyenne", "mediane", "total"
+STATISTIQUES = ["moyenne", "mediane"]
+
+FICHIER_SORTIE = "synthese_beneficiaires_vs_non_beneficiaires.xlsx"
+
+FORMAT_EURO = '#,##0 "€"'
+FORMAT_NOMBRE = '#,##0'
+FORMAT_DECIMAL = '#,##0.00'
+FORMAT_PCT = '+0.0%;-0.0%;0.0%'
+
+CONTEXTE = {
+    "Objectif de l'étude": (
+        "Mesurer l'effet d'un entretien conseil sur les encours et indicateurs "
+        "financiers des clients, en comparant les bénéficiaires d'un entretien "
+        "à un groupe de non-bénéficiaires."
+    ),
+    "Population bénéficiaires": "Clients ayant bénéficié d'un entretien. [À COMPLÉTER : règle de sélection]",
+    "Population non-bénéficiaires": "Clients sans entretien sur la période. [À COMPLÉTER : groupe témoin]",
+    "Périmètre client": "[À COMPLÉTER : segments, agences, exclusions]",
+    "Horizons d'observation": "M = mois de l'entretien. M-1 = mois précédent, puis M+1, M+3 et M+6.",
+    "Lecture du tableau": (
+        "Tous mois d'entretien confondus. Pour chaque indicateur : valeur des "
+        "bénéficiaires, des non-bénéficiaires, puis l'écart en % "
+        "(bénéficiaires / non-bénéficiaires − 1). Écart positif en vert : les "
+        "bénéficiaires sont au-dessus du groupe témoin."
+    ),
+    "Source des données": "[À COMPLÉTER : datasets, date d'extraction]",
+}
+
+
+# ============================================================
+# 2. LECTURE DES DONNEES
+# ============================================================
+
+df_benef = data_benef
+df_non_benef = data_non_benef
+
+print(f"Bénéficiaires : {len(df_benef):,} lignes")
+print(f"Non-bénéficiaires : {len(df_non_benef):,} lignes")
+
+
+# ============================================================
+# 3. VERIFICATION DES COLONNES
+# ============================================================
+
+def colonnes_manquantes(df):
+    return [f"{m}{s}" for m in METRICS for s in HORIZONS.values() if f"{m}{s}" not in df.columns]
+
+
+manquantes_benef = colonnes_manquantes(df_benef)
+manquantes_non_benef = colonnes_manquantes(df_non_benef)
+for nom, manq in [("bénéficiaires", manquantes_benef), ("non-bénéficiaires", manquantes_non_benef)]:
+    if manq:
+        print(f"ATTENTION - colonnes manquantes dans {nom} : {', '.join(manq)}")
+
+if COLONNE_MOIS_ENTRETIEN in df_benef.columns:
+    MOIS_ENTRETIEN = sorted(set(df_benef[COLONNE_MOIS_ENTRETIEN].dropna().astype(str)))
+else:
+    MOIS_ENTRETIEN = []
+
+
+# ============================================================
+# 4. CALCULS
+# ============================================================
+
+def statistique(df, colonne, stat):
+    if colonne not in df.columns:
+        return np.nan
+    s = pd.to_numeric(df[colonne], errors="coerce").dropna()
+    if len(s) == 0:
+        return np.nan
+    return {"moyenne": s.mean(), "mediane": s.median(), "total": s.sum()}[stat]
+
+
+def effectif(df, suffixe):
+    """Clients ayant au moins un indicateur renseigné à cet horizon."""
+    cols = [f"{m}{suffixe}" for m in METRICS if f"{m}{suffixe}" in df.columns]
+    if not cols:
+        return np.nan
+    return int(df[cols].notna().any(axis=1).sum())
+
+
+# ============================================================
+# 5. STYLES
+# ============================================================
+
+BLEU_FONCE = "17365D"
+BLEU = "5B9BD5"
+BLEU_CLAIR = "DDEBF7"
+BLEU_TRES_CLAIR = "F2F7FC"
+JAUNE = "FFD966"
+BLANC = "FFFFFF"
+VERT = "2E7D32"
+ROUGE = "C00000"
+
+blanc = Side(style="thin", color=BLANC)
+BORD = Border(left=blanc, right=blanc, top=blanc, bottom=blanc)
+
+COL_BLOC, COL_LIB, COL_DEBUT = 1, 2, 3
+COL_FIN = COL_DEBUT + len(HORIZONS) - 1
+NOMS_STATS = {"moyenne": "Moyenne", "mediane": "Médiane", "total": "Total"}
+
+
+def remplir(ws, ligne, col_debut, col_fin, couleur):
+    for c in range(col_debut, col_fin + 1):
+        ws.cell(row=ligne, column=c).fill = PatternFill("solid", fgColor=couleur)
+        ws.cell(row=ligne, column=c).border = BORD
+
+
+def bloc_vertical(ws, debut, fin, texte):
+    ws.merge_cells(start_row=debut, start_column=COL_BLOC, end_row=fin, end_column=COL_BLOC)
+    c = ws.cell(row=debut, column=COL_BLOC, value=texte)
+    c.font = Font(bold=True, color=BLANC, size=11)
+    c.fill = PatternFill("solid", fgColor=BLEU_FONCE)
+    # Libellé en haut pour les longs blocs, sinon il serait invisible à l'écran
+    c.alignment = Alignment(horizontal="center", vertical="center" if fin - debut < 15 else "top",
+                            wrap_text=True)
+    for r in range(debut, fin + 1):
+        ws.cell(row=r, column=COL_BLOC).fill = PatternFill("solid", fgColor=BLEU_FONCE)
+
+
+def ligne_titre(ws, ligne, texte):
+    """Ligne d'indicateur (bleu moyen, comme 'SF totale' chez la collègue)."""
+    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU)
+    c = ws.cell(row=ligne, column=COL_LIB, value=texte)
+    c.font = Font(bold=True, color=BLANC)
+
+
+def ligne_valeurs(ws, ligne, libelle, valeurs, fmt, gras=False):
+    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU_TRES_CLAIR)
+    c = ws.cell(row=ligne, column=COL_LIB, value="    " + libelle)
+    c.fill = PatternFill("solid", fgColor=BLEU_CLAIR)
+    c.font = Font(bold=gras)
+    for j, v in enumerate(valeurs, COL_DEBUT):
+        cell = ws.cell(row=ligne, column=j, value=None if pd.isna(v) else float(v))
+        cell.number_format = fmt
+        cell.alignment = Alignment(horizontal="center")
+        cell.font = Font(bold=gras)
+
+
+def ligne_ecart(ws, ligne, ligne_b, ligne_n):
+    """Écart en % calculé par formule Excel : bénéf / non-bénéf - 1."""
+    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU_TRES_CLAIR)
+    c = ws.cell(row=ligne, column=COL_LIB, value="    Écart bénéf. / non-bénéf.")
+    c.fill = PatternFill("solid", fgColor=BLEU_CLAIR)
+    c.font = Font(bold=True, italic=True)
+    for j in range(COL_DEBUT, COL_FIN + 1):
+        L = get_column_letter(j)
+        cell = ws.cell(row=ligne, column=j,
+                       value=f'=IFERROR({L}{ligne_b}/{L}{ligne_n}-1,"")')
+        cell.number_format = FORMAT_PCT
+        cell.alignment = Alignment(horizontal="center")
+        cell.font = Font(bold=True, italic=True)
+
+
+# ============================================================
+# 6. ONGLET SYNTHESE
+# ============================================================
+
+wb = Workbook()
+ws = wb.active
+ws.title = "Synthèse"
+ws.sheet_view.showGridLines = False
+
+# Titre (bandeau jaune sur deux lignes)
+for r in (1, 2):
+    remplir(ws, r, 1, COL_FIN, JAUNE)
+ws.cell(row=1, column=1, value="Bénéficiaires vs non-bénéficiaires d'un entretien").font = Font(bold=True, size=14)
+ws.cell(row=2, column=1, value="Avant et après le mois M de l'entretien — tous mois d'entretien confondus").font = Font(italic=True, size=9)
+ws.row_dimensions[1].height = 22
+
+# En-tête des horizons
+ligne = 4
+remplir(ws, ligne, COL_BLOC, COL_FIN, BLEU_FONCE)
+ws.cell(row=ligne, column=COL_BLOC, value="Statistique")
+for j, h in enumerate(HORIZONS, COL_DEBUT):
+    ws.cell(row=ligne, column=j, value=h)
+for j in range(COL_BLOC, COL_FIN + 1):
+    c = ws.cell(row=ligne, column=j)
+    c.font = Font(bold=True, color=BLANC)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+ws.row_dimensions[ligne].height = 24
+ligne_entete = ligne
+ligne += 1
+
+# Bloc Effectifs
+debut = ligne
+ligne_titre(ws, ligne, "Nombre de clients")
+ligne += 1
+ligne_valeurs(ws, ligne, "Bénéficiaires", [effectif(df_benef, s) for s in HORIZONS.values()], FORMAT_NOMBRE)
+ligne += 1
+ligne_valeurs(ws, ligne, "Non-bénéficiaires", [effectif(df_non_benef, s) for s in HORIZONS.values()], FORMAT_NOMBRE)
+bloc_vertical(ws, debut, ligne, "Effectifs")
+ligne += 2
+
+# Un bloc vertical par statistique, un groupe de 4 lignes par indicateur
+lignes_ecart = []
+for stat in STATISTIQUES:
+    debut = ligne
+    for m in METRICS:
+        fmt = FORMAT_DECIMAL if m in METRIQUES_NON_EURO else FORMAT_EURO
+        ligne_titre(ws, ligne, LIBELLES.get(m, m))
+        ligne += 1
+        lb = ligne
+        ligne_valeurs(ws, ligne, "Bénéficiaires",
+                      [statistique(df_benef, f"{m}{s}", stat) for s in HORIZONS.values()], fmt)
+        ligne += 1
+        ln = ligne
+        ligne_valeurs(ws, ligne, "Non-bénéficiaires",
+                      [statistique(df_non_benef, f"{m}{s}", stat) for s in HORIZONS.values()], fmt)
+        ligne += 1
+        ligne_ecart(ws, ligne, lb, ln)
+        lignes_ecart.append(ligne)
+        ligne += 1
+    bloc_vertical(ws, debut, ligne - 1, NOMS_STATS[stat])
+    ligne += 1
+
+# Écart en vert si positif, en rouge si négatif
+plage_debut, plage_fin = get_column_letter(COL_DEBUT), get_column_letter(COL_FIN)
+for r in lignes_ecart:
+    plage = f"{plage_debut}{r}:{plage_fin}{r}"
+    ws.conditional_formatting.add(plage, CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=VERT, bold=True, italic=True)))
+    ws.conditional_formatting.add(plage, CellIsRule(operator="lessThan", formula=["0"], font=Font(color=ROUGE, bold=True, italic=True)))
+
+ws.column_dimensions[get_column_letter(COL_BLOC)].width = 14
+ws.column_dimensions[get_column_letter(COL_LIB)].width = 38
+for j in range(COL_DEBUT, COL_FIN + 1):
+    ws.column_dimensions[get_column_letter(j)].width = 14
+ws.freeze_panes = ws.cell(row=ligne_entete + 1, column=COL_DEBUT)
+
+
+# ============================================================
+# 7. ONGLET CONTEXTE ET PERIMETRE
+# ============================================================
+
+ctx = wb.create_sheet("Contexte et Périmètre")
+ctx.sheet_view.showGridLines = False
+remplir(ctx, 1, 1, 2, JAUNE)
+ctx.cell(row=1, column=1, value="Contexte et périmètre de l'analyse").font = Font(bold=True, size=14)
+ctx.row_dimensions[1].height = 22
+
+infos = dict(CONTEXTE)
+infos["Mois d'entretien couverts"] = ", ".join(MOIS_ENTRETIEN) or "-"
+infos["Effectifs bruts"] = f"Bénéficiaires : {len(df_benef):,} — Non-bénéficiaires : {len(df_non_benef):,}".replace(",", " ")
+if manquantes_benef or manquantes_non_benef:
+    infos["Colonnes manquantes"] = ", ".join(sorted(set(manquantes_benef + manquantes_non_benef)))
+
+for i, (titre, texte) in enumerate(infos.items(), 3):
+    a = ctx.cell(row=i, column=1, value=titre)
+    a.font = Font(bold=True, color=BLANC)
+    a.fill = PatternFill("solid", fgColor=BLEU_FONCE)
+    a.alignment = Alignment(vertical="center", wrap_text=True)
+    a.border = BORD
+    b = ctx.cell(row=i, column=2, value=texte)
+    b.fill = PatternFill("solid", fgColor=BLEU_TRES_CLAIR)
+    b.alignment = Alignment(vertical="center", wrap_text=True)
+    b.border = BORD
+    ctx.row_dimensions[i].height = 32
+ctx.column_dimensions["A"].width = 30
+ctx.column_dimensions["B"].width = 100
+
+
+# ============================================================
+# 8. SAUVEGARDE
+# ============================================================
+
+wb.save(FICHIER_SORTIE)
+print(f"Fichier créé : {Path(FICHIER_SORTIE).resolve()}")
