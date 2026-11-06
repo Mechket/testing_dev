@@ -57,8 +57,8 @@ LIBELLES = {
 # Métriques qui ne sont PAS des euros (affichées avec 2 décimales)
 METRIQUES_NON_EURO = ['nbr_cnt_tot', 'nbr_gam_tot']
 
-# Blocs verticaux à afficher : "moyenne", "mediane", "total"
-STATISTIQUES = ["moyenne", "mediane"]
+# Blocs verticaux à afficher, dans cet ordre : "total", "moyenne", "mediane"
+STATISTIQUES = ["total", "moyenne"]
 
 FICHIER_SORTIE = "synthese_beneficiaires_vs_non_beneficiaires.xlsx"
 
@@ -81,7 +81,9 @@ CONTEXTE = {
         "Tous mois d'entretien confondus. Pour chaque indicateur : valeur des "
         "bénéficiaires, des non-bénéficiaires, puis l'écart en % "
         "(bénéficiaires / non-bénéficiaires − 1). Écart positif en vert : les "
-        "bénéficiaires sont au-dessus du groupe témoin."
+        "bénéficiaires sont au-dessus du groupe témoin. La dernière colonne donne "
+        "l'évolution entre M-1 et M+6 (M+6 / M-1 − 1) ; sur la ligne Écart, c'est "
+        "la différence d'évolution bénéficiaires − non-bénéficiaires, en points."
     ),
     "Source des données": "[À COMPLÉTER : datasets, date d'extraction]",
 }
@@ -157,6 +159,13 @@ BORD = Border(left=blanc, right=blanc, top=blanc, bottom=blanc)
 
 COL_BLOC, COL_LIB, COL_DEBUT = 1, 2, 3
 COL_FIN = COL_DEBUT + len(HORIZONS) - 1
+COL_EVOL = COL_FIN + 1                     # colonne d'évolution premier -> dernier horizon
+H_PREMIER, H_DERNIER = list(HORIZONS)[0], list(HORIZONS)[-1]
+LIB_EVOL = f"Évol. {H_PREMIER} → {H_DERNIER}"
+FORMAT_POINTS = '+0.0" pts";-0.0" pts";0.0" pts"'
+VERT_FONCE = "375623"
+L_PREMIER, L_DERNIER, L_EVOL = (get_column_letter(COL_DEBUT), get_column_letter(COL_FIN),
+                                get_column_letter(COL_EVOL))
 NOMS_STATS = {"moyenne": "Moyenne", "mediane": "Médiane", "total": "Total"}
 
 
@@ -180,13 +189,13 @@ def bloc_vertical(ws, debut, fin, texte):
 
 def ligne_titre(ws, ligne, texte):
     """Ligne d'indicateur (bleu moyen, comme 'SF totale' chez la collègue)."""
-    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU)
+    remplir(ws, ligne, COL_LIB, COL_EVOL, BLEU)
     c = ws.cell(row=ligne, column=COL_LIB, value=texte)
     c.font = Font(bold=True, color=BLANC)
 
 
 def ligne_valeurs(ws, ligne, libelle, valeurs, fmt, gras=False):
-    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU_TRES_CLAIR)
+    remplir(ws, ligne, COL_LIB, COL_EVOL, BLEU_TRES_CLAIR)
     c = ws.cell(row=ligne, column=COL_LIB, value="    " + libelle)
     c.fill = PatternFill("solid", fgColor=BLEU_CLAIR)
     c.font = Font(bold=gras)
@@ -195,11 +204,17 @@ def ligne_valeurs(ws, ligne, libelle, valeurs, fmt, gras=False):
         cell.number_format = fmt
         cell.alignment = Alignment(horizontal="center")
         cell.font = Font(bold=gras)
+    # Évolution entre le premier et le dernier horizon (ex. M+6 / M-1 - 1)
+    cell = ws.cell(row=ligne, column=COL_EVOL,
+                   value=f'=IFERROR({L_DERNIER}{ligne}/{L_PREMIER}{ligne}-1,"")')
+    cell.number_format = FORMAT_PCT
+    cell.alignment = Alignment(horizontal="center")
+    cell.font = Font(bold=True)
 
 
 def ligne_ecart(ws, ligne, ligne_b, ligne_n):
     """Écart en % calculé par formule Excel : bénéf / non-bénéf - 1."""
-    remplir(ws, ligne, COL_LIB, COL_FIN, BLEU_TRES_CLAIR)
+    remplir(ws, ligne, COL_LIB, COL_EVOL, BLEU_TRES_CLAIR)
     c = ws.cell(row=ligne, column=COL_LIB, value="    Écart bénéf. / non-bénéf.")
     c.fill = PatternFill("solid", fgColor=BLEU_CLAIR)
     c.font = Font(bold=True, italic=True)
@@ -210,6 +225,12 @@ def ligne_ecart(ws, ligne, ligne_b, ligne_n):
         cell.number_format = FORMAT_PCT
         cell.alignment = Alignment(horizontal="center")
         cell.font = Font(bold=True, italic=True)
+    # Écart d'évolution : évol. bénéficiaires - évol. non-bénéficiaires, en points
+    cell = ws.cell(row=ligne, column=COL_EVOL,
+                   value=f'=IFERROR(({L_EVOL}{ligne_b}-{L_EVOL}{ligne_n})*100,"")')
+    cell.number_format = FORMAT_POINTS
+    cell.alignment = Alignment(horizontal="center")
+    cell.font = Font(bold=True, italic=True)
 
 
 # ============================================================
@@ -223,7 +244,7 @@ ws.sheet_view.showGridLines = False
 
 # Titre (bandeau jaune sur deux lignes)
 for r in (1, 2):
-    remplir(ws, r, 1, COL_FIN, JAUNE)
+    remplir(ws, r, 1, COL_EVOL, JAUNE)
 ws.cell(row=1, column=1, value="Bénéficiaires vs non-bénéficiaires d'un entretien").font = Font(bold=True, size=14)
 ws.cell(row=2, column=1, value="Avant et après le mois M de l'entretien — tous mois d'entretien confondus").font = Font(italic=True, size=9)
 ws.row_dimensions[1].height = 22
@@ -231,13 +252,15 @@ ws.row_dimensions[1].height = 22
 # En-tête des horizons
 ligne = 4
 remplir(ws, ligne, COL_BLOC, COL_FIN, BLEU_FONCE)
+remplir(ws, ligne, COL_EVOL, COL_EVOL, VERT_FONCE)
 ws.cell(row=ligne, column=COL_BLOC, value="Statistique")
 for j, h in enumerate(HORIZONS, COL_DEBUT):
     ws.cell(row=ligne, column=j, value=h)
-for j in range(COL_BLOC, COL_FIN + 1):
+ws.cell(row=ligne, column=COL_EVOL, value=LIB_EVOL)
+for j in range(COL_BLOC, COL_EVOL + 1):
     c = ws.cell(row=ligne, column=j)
     c.font = Font(bold=True, color=BLANC)
-    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 ws.row_dimensions[ligne].height = 24
 ligne_entete = ligne
 ligne += 1
@@ -275,7 +298,7 @@ for stat in STATISTIQUES:
     ligne += 1
 
 # Écart en vert si positif, en rouge si négatif
-plage_debut, plage_fin = get_column_letter(COL_DEBUT), get_column_letter(COL_FIN)
+plage_debut, plage_fin = L_PREMIER, L_EVOL
 for r in lignes_ecart:
     plage = f"{plage_debut}{r}:{plage_fin}{r}"
     ws.conditional_formatting.add(plage, CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=VERT, bold=True, italic=True)))
@@ -285,6 +308,7 @@ ws.column_dimensions[get_column_letter(COL_BLOC)].width = 14
 ws.column_dimensions[get_column_letter(COL_LIB)].width = 38
 for j in range(COL_DEBUT, COL_FIN + 1):
     ws.column_dimensions[get_column_letter(j)].width = 14
+ws.column_dimensions[L_EVOL].width = 17
 ws.freeze_panes = ws.cell(row=ligne_entete + 1, column=COL_DEBUT)
 
 
